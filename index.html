@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>币安合约 · 高回报率持仓榜</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg1:#050814; --bg2:#0a1228; --panel:rgba(16,24,48,.72); --line:#1d2f5e;
+    --txt:#e6ecff; --sub:#7e92c0; --blue:#3a7bd5; --blue2:#6aa6ff;
+    --green:#22c55e; --red:#ef4444; --amber:#f5b759;
+  }
+  body {
+    font-family:"Microsoft YaHei UI","PingFang SC",system-ui,sans-serif;
+    color:var(--txt); min-height:100vh; padding:16px 18px 32px;
+    background:
+      radial-gradient(900px 500px at 50% -10%, rgba(255,180,60,.18), transparent 60%),
+      radial-gradient(1200px 600px at 10% -10%, rgba(58,123,213,.22), transparent 60%),
+      radial-gradient(900px 500px at 110% 110%, rgba(192,57,43,.18), transparent 55%),
+      linear-gradient(160deg, var(--bg1) 0%, var(--bg2) 70%, #0c1a3a 100%);
+    background-attachment: fixed;
+  }
+  body::before {
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:0; opacity:.35;
+    background-image:
+      linear-gradient(rgba(58,123,213,.08) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(58,123,213,.08) 1px, transparent 1px);
+    background-size: 44px 44px;
+    mask-image: radial-gradient(ellipse at 50% 0%, #000 40%, transparent 80%);
+  }
+  header { position:relative; z-index:1; text-align:center; margin:18px 0 16px; }
+  .brand {
+    display:inline-block; position:relative; padding:6px 28px;
+  }
+  .brand::before, .brand::after {
+    content:""; position:absolute; top:50%; width:46px; height:2px;
+    background:linear-gradient(90deg, transparent, #d4af37, transparent);
+  }
+  .brand::before { left:-58px; }
+  .brand::after { right:-58px; transform:scaleX(-1); }
+  h1 {
+    font-size:30px; font-weight:900; letter-spacing:3px;
+    background:linear-gradient(90deg,#ffd76a 0%, #ff6b35 30%, #c0392b 55%, #ffd76a 100%);
+    background-size:200% 100%;
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+    animation:shine 4s linear infinite;
+    text-shadow: 0 0 30px rgba(255,180,60,.25);
+  }
+  @keyframes shine { to { background-position:200% 0; } }
+  .dragon {
+    display:block; font-size:14px; letter-spacing:10px; margin-top:6px;
+    color:#d4af37; opacity:.85;
+  }
+  .sub { font-size:12px; color:var(--sub); margin-top:6px; letter-spacing:2px; }
+  .hgroup { position:relative; z-index:1; display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center; margin-bottom:14px; }
+
+  button {
+    font-family:inherit; font-size:12px; cursor:pointer; border:none; border-radius:8px;
+    padding:7px 12px; color:#fff; background:linear-gradient(135deg,#1b4fa0,#3a7bd5);
+    transition:filter .15s, transform .05s; white-space:nowrap;
+  }
+  button:hover { filter:brightness(1.15); }
+  button:active { transform:translateY(1px); }
+  button.ghost { background:rgba(20,35,74,.6); border:1px solid var(--line); color:var(--blue2); }
+  button.ghost:hover { background:#14234a; }
+
+  #status {
+    font-size:11px; color:var(--sub); background:rgba(10,14,26,.7); border:1px solid var(--line);
+    border-radius:8px; padding:6px 10px; line-height:1.4;
+    max-width:380px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .acct-select {
+    background:#14234a; color:var(--txt); border:1px solid var(--line);
+    border-radius:7px; padding:6px 8px; font-size:12px; cursor:pointer;
+  }
+
+  .tbl-wrap {
+    position:relative; z-index:1; margin-top:18px; overflow:auto;
+    border:1px solid var(--line); border-radius:14px; background:var(--panel);
+    box-shadow:0 10px 40px rgba(0,0,0,.5); backdrop-filter: blur(6px);
+  }
+  table { width:100%; border-collapse:collapse; font-size:14px; min-width:640px; }
+  thead th {
+    position:sticky; top:0; z-index:2; background:#0e1730; color:var(--blue2);
+    text-align:left; font-weight:600; padding:13px 16px; border-bottom:1px solid var(--line); white-space:nowrap;
+  }
+  tbody td { padding:12px 16px; border-bottom:1px solid rgba(29,47,94,.4); white-space:nowrap; }
+  tbody tr:hover { background:rgba(58,123,213,.1); }
+  .sym { font-weight:700; letter-spacing:.3px; }
+  .side-long { color:var(--green); font-weight:700; }
+  .side-short { color:var(--red); font-weight:700; }
+  .num { font-family:Consolas,"Courier New",monospace; }
+  .roi-pos { color:var(--green); font-weight:700; }
+  .empty { text-align:center; color:var(--sub); padding:60px 0; font-size:14px; }
+  .empty .big { font-size:16px; color:var(--blue2); margin-bottom:6px; }
+  .loading-dots::after { content:""; display:inline-block; width:10px; animation:dots 1.2s infinite steps(4); }
+  @keyframes dots { 0%{content:""} 25%{content:"·"} 50%{content:"··"} 75%{content:"···"} }
+
+  .overlay { display:none; position:fixed; inset:0; z-index:10; background:rgba(5,8,20,.75); }
+  .overlay.show { display:flex; align-items:center; justify-content:center; }
+  .modal {
+    width:min(620px,94vw); max-height:86vh; overflow:auto;
+    background:linear-gradient(160deg,#101a30,#0c1428); border:1px solid #2a3c6e;
+    border-radius:16px; padding:22px 24px; box-shadow:0 20px 60px rgba(0,0,0,.6);
+  }
+  .modal h3 { font-size:16px; margin-bottom:4px; }
+  .modal .m-sub { font-size:12px; color:var(--sub); margin-bottom:14px; }
+  .key-row { display:grid; grid-template-columns:96px 1fr 1fr 30px; gap:8px; margin-bottom:10px; align-items:center; }
+  .key-row input {
+    width:100%; background:#0a1020; border:1px solid var(--line); border-radius:8px;
+    color:var(--txt); padding:8px 10px; font-size:12px; font-family:Consolas,monospace; outline:none;
+  }
+  .key-row input:focus { border-color:var(--blue); }
+  .key-row .del { color:var(--red); background:none; border:none; cursor:pointer; font-size:16px; padding:6px; }
+  .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
+  .modal-actions .note { font-size:11px; color:var(--sub); margin-right:auto; padding-top:8px; }
+  .err { color:var(--red); font-size:12px; margin-top:8px; min-height:16px; }
+
+  .add-btn {
+    font-size:12px; padding:6px 14px; border-radius:7px;
+    background:linear-gradient(135deg,#1a6b3a,#22c55e); cursor:pointer;
+  }
+  .add-btn:hover { filter:brightness(1.15); }
+  .add-btn:disabled { opacity:.6; cursor:wait; }
+  .acct-name { color:var(--blue2); font-size:12px; background:rgba(58,123,213,.12); padding:3px 10px; border-radius:6px; display:inline-block; }
+
+  .net-ping {
+    font-size:11px; padding:5px 10px; border-radius:16px; font-weight:600;
+    border:1px solid var(--line); background:rgba(10,14,26,.7); white-space:nowrap;
+  }
+  .net-ok { color:#22c55e; border-color:#22c55e; }
+  .net-ok::before { content:"● "; }
+  .net-fail { color:#ef4444; border-color:#ef4444; animation:blink 1s infinite; }
+  .net-fail::before { content:"● "; }
+  .net-unknown { color:var(--sub); }
+  .net-unknown::before { content:"◌ "; }
+  @keyframes blink { 50% { opacity:.4; } }
+
+  .countdown {
+    font-family:Consolas,"Courier New",monospace; font-size:18px; font-weight:700;
+    color:#6aa6ff; background:rgba(20,35,74,.8); border:1px solid #3a7bd5;
+    border-radius:8px; padding:3px 10px; min-width:60px; text-align:center;
+    box-shadow:0 0 12px rgba(58,123,213,.4); letter-spacing:1px;
+  }
+  .countdown small { font-size:12px; color:var(--sub); margin-left:2px; }
+  .countdown.running { color:#22c55e; border-color:#22c55e; box-shadow:0 0 12px rgba(34,197,94,.4); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>币安合约 · 大夏龙国量化基金</h1>
+    <span class="dragon">✦ 龙 腾 四 海 · 量 贯 长 虹 ✦</span>
+  </div>
+  <div class="sub">高回报率持仓监控 · 密钥仅保存在本浏览器</div>
+</header>
+
+<div class="hgroup">
+  <select id="roiFilter" class="acct-select" title="ROI 阈值筛选">
+    <option value="50">ROI ≥ 50%</option>
+    <option value="100" selected>ROI ≥ 100%</option>
+    <option value="150">ROI ≥ 150%</option>
+    <option value="200">ROI ≥ 200%</option>
+    <option value="300">ROI ≥ 300%</option>
+  </select>
+  <div id="status">未加载。请先「设置账户」。</div>
+  <span id="netStatus" class="net-ping net-unknown">检测中…</span>
+  <span id="countdown" class="countdown" style="display:none">--<small>s</small></span>
+  <button class="ghost" id="btnKeys">⚙ 设置账户</button>
+  <button id="btnRefresh">⟳ 刷新数据</button>
+  <button id="btnAuto">▶ 开始自动</button>
+</div>
+
+<div class="tbl-wrap">
+  <table>
+    <thead><tr>
+      <th>账户</th><th>交易对名称</th><th>方向</th><th>持仓数量(USDT)</th><th>投资回报率</th><th>操作</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <h3>设置 API 密钥</h3>
+    <div class="m-sub">每个账户一行：API Key + Secret。只读持仓权限即可，密钥只存本浏览器 localStorage。</div>
+    <div id="keyRows"></div>
+    <button class="ghost" id="btnAddKey">+ 添加账户</button>
+    <div class="err" id="keyErr"></div>
+    <div class="modal-actions">
+      <span class="note">保存后点「刷新数据」</span>
+      <button class="ghost" id="btnCancel">取消</button>
+      <button id="btnSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ============== 常量 / DOM 引用 ============== */
+const FAPI = "https://fapi.binance.com";
+const $status   = document.getElementById("status");
+const $tbody    = document.getElementById("tbody");
+const $net      = document.getElementById("netStatus");
+const $cd       = document.getElementById("countdown");
+const $autoBtn  = document.getElementById("btnAuto");
+const $roiSel   = document.getElementById("roiFilter");
+
+let ROI_MIN = (() => {
+  const v = parseFloat(localStorage.getItem("roi_min_v1") || "100");
+  return isNaN(v) ? 100 : v;
+})();
+function saveRoiMin(v){ ROI_MIN = v; try{ localStorage.setItem("roi_min_v1", String(v)); }catch(e){} }
+
+function esc(s){ return String(s == null ? "" : s)
+  .replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+
+/* ============== SHA-256 / HMAC（纯 JS 兜底） ============== */
+function _bytesToHex(b){ return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join(""); }
+function _sha256(data){
+  const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const R = (x,n) => (x>>>n)|(x<<(32-n));
+  const total = (((data.length+9+63)>>>6)*64)>>>0;
+  const by = new Uint8Array(total); by.set(data); by[data.length] = 0x80;
+  const bitLen = data.length*8, dv = new DataView(by.buffer);
+  dv.setUint32(by.length-4, bitLen>>>0); dv.setUint32(by.length-8, Math.floor(bitLen/0x100000000));
+  const w = new Uint32Array(total/4);
+  for(let i=0;i<w.length;i++) w[i]=dv.getUint32(i*4);
+  const W = new Uint32Array(64);
+  for(let block=0; block<w.length; block+=16){
+    for(let t=0;t<16;t++) W[t]=w[block+t];
+    for(let t=16;t<64;t++){
+      const s0 = R(W[t-15],7)^R(W[t-15],18)^(W[t-15]>>>3);
+      const s1 = R(W[t-2],17)^R(W[t-2],19)^(W[t-2]>>>10);
+      W[t] = (W[t-16]+s0+W[t-7]+s1)>>>0;
+    }
+    let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for(let t=0;t<64;t++){
+      const S1=R(e,6)^R(e,11)^R(e,25), ch=(e&f)^(~e&g), t1=(h+S1+ch+K[t]+W[t])>>>0;
+      const S0=R(a,2)^R(a,13)^R(a,22), maj=(a&b)^(a&c)^(b&c), t2=(S0+maj)>>>0;
+      h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+    }
+    H[0]=(H[0]+a)>>>0;H[1]=(H[1]+b)>>>0;H[2]=(H[2]+c)>>>0;H[3]=(H[3]+d)>>>0;
+    H[4]=(H[4]+e)>>>0;H[5]=(H[5]+f)>>>0;H[6]=(H[6]+g)>>>0;H[7]=(H[7]+h)>>>0;
+  }
+  const out = new Uint8Array(32), ov = new DataView(out.buffer);
+  for(let i=0;i<8;i++) ov.setUint32(i*4, H[i]);
+  return out;
+}
+function _hmac(key, data){
+  const BLOCK=64; let k=new Uint8Array(BLOCK);
+  if(key.length>BLOCK) key=_sha256(key);
+  k.set(key);
+  const ipad=new Uint8Array(BLOCK), opad=new Uint8Array(BLOCK);
+  for(let i=0;i<BLOCK;i++){ ipad[i]=k[i]^0x36; opad[i]=k[i]^0x5c; }
+  const inner=new Uint8Array(BLOCK+data.length); inner.set(ipad); inner.set(data,BLOCK);
+  const outer=new Uint8Array(BLOCK+BLOCK); outer.set(opad); outer.set(_sha256(inner),BLOCK);
+  return _sha256(outer);
+}
+async function signQuery(query, secret){
+  const msg=new TextEncoder().encode(query), key=new TextEncoder().encode(secret);
+  if(window.crypto && crypto.subtle){
+    try{
+      const ko = await crypto.subtle.importKey("raw", key, {name:"HMAC",hash:"SHA-256"}, false, ["sign"]);
+      const sig = await crypto.subtle.sign("HMAC", ko, msg);
+      return _bytesToHex(new Uint8Array(sig));
+    }catch(e){}
+  }
+  return _bytesToHex(_hmac(key, msg));
+}
+
+/* ============== 时间同步 ============== */
+let serverRefMs=0, serverRefPerf=0, syncOk=false;
+async function ensureOffset(){
+  if(syncOk && performance.now()-serverRefPerf<60000) return;
+  for(const url of [FAPI+"/fapi/v1/time", "https://api.binance.com/api/v3/time"]){
+    try{
+      const r = await fetch(url, {method:"GET"});
+      const d = await r.json();
+      const ms = Number(d.serverTime);
+      if(ms>0){ serverRefMs=ms; serverRefPerf=performance.now(); syncOk=true; return; }
+    }catch(e){}
+  }
+  syncOk=false;
+}
+async function nowMs(){
+  await ensureOffset();
+  return serverRefMs>0 ? Math.round(serverRefMs+(performance.now()-serverRefPerf)) : Date.now();
+}
+
+/* ============== 密钥 / 请求 ============== */
+function loadKeys(){ try{ return JSON.parse(localStorage.getItem("roi_keys_v1")||"[]"); }catch(e){ return []; } }
+function saveKeys(k){ localStorage.setItem("roi_keys_v1", JSON.stringify(k)); }
+function acctName(acct, idx){ return acct.name || ("账户"+(idx+1)); }
+
+async function fetchJson(url, opts, timeoutMs=15000){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), timeoutMs);
+  try{
+    const r = await fetch(url, Object.assign({}, opts, {signal:ctl.signal}));
+    return await r.json();
+  }finally{ clearTimeout(t); }
+}
+async function signedFetch(acct, method, path, query){
+  const doFetch = async(q) => {
+    const sig = await signQuery(q, acct.api_secret);
+    return fetchJson(FAPI+path+"?"+q+"&signature="+sig,
+      {method, headers:{"X-MBX-APIKEY":acct.api_key}});
+  };
+  let data = await doFetch(query);
+  if(data && data.code===-1021){
+    await ensureOffset();
+    data = await doFetch(query.replace(/timestamp=\d+/, "timestamp="+(await nowMs())));
+  }
+  return data;
+}
+async function apiGetPositions(acct){
+  return signedFetch(acct, "GET", "/fapi/v2/positionRisk",
+    "timestamp="+(await nowMs())+"&recvWindow=10000");
+}
+
+/* ============== 数据处理 ============== */
+function positionInfo(p){
+  const amt = parseFloat(p.positionAmt)||0;
+  const mark = parseFloat(p.markPrice)||0;
+  const unrealized = parseFloat(p.unRealizedProfit)||0;
+  const lev = parseFloat(p.leverage)||0;
+  let margin = parseFloat(p.positionInitialMargin)||parseFloat(p.isolatedMargin)||parseFloat(p.initialMargin)||0;
+  if(margin<=0){
+    const notional = Math.abs(parseFloat(p.notional)||(amt*mark));
+    if(lev>0 && notional>0) margin = notional/lev;
+  }
+  const roi = margin>0 ? unrealized/margin*100 : 0;
+  const notional = Math.abs(amt)*mark;
+  return {amt, mark, unrealized, roi, notional};
+}
+function fmtRoi(v){ return (v>=0?"+":"") + v.toFixed(2) + "%"; }
+function fmtUsd(v){ return "$" + Math.abs(v).toLocaleString("en-US",{maximumFractionDigits:2}); }
+
+/* ============== exchangeInfo 缓存 ============== */
+const RULES_KEY="roi_rules_v1";
+let rulesCache=null;
+async function getRules(){
+  if(rulesCache) return rulesCache;
+  try{
+    const c = JSON.parse(localStorage.getItem(RULES_KEY)||"null");
+    if(c && c.map && Date.now()-c.t < 6*3600*1000){ rulesCache=c.map; return rulesCache; }
+  }catch(e){}
+  const d = await fetchJson(FAPI+"/fapi/v1/exchangeInfo", {method:"GET"}, 40000);
+  const map={};
+  for(const s of (d.symbols||[])){
+    const f={};
+    for(const x of (s.filters||[])) f[x.filterType]=x;
+    const lot = f.MARKET_LOT_SIZE || f.LOT_SIZE;
+    let step = parseFloat((lot||{}).stepSize)||0;
+    if(step<=0) step = Math.pow(10, -(parseInt(s.quantityPrecision,10)||4));
+    map[s.symbol] = {
+      minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional)||0,
+      step,
+      pricePrec: parseInt(s.pricePrecision,10)||2
+    };
+  }
+  rulesCache=map;
+  try{ localStorage.setItem(RULES_KEY, JSON.stringify({t:Date.now(), map})); }catch(e){}
+  return map;
+}
+
+/* ============== 持仓查询 / 下单 / 止损 ============== */
+async function postOrderAuto(acct, baseQuery, wantDir){
+  const side = wantDir==="long" ? "BUY" : "SELL";
+  const cands = wantDir==="long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+  for(const ps of cands){
+    const q = baseQuery + "&side="+side + "&positionSide="+ps +
+      "&timestamp="+(await nowMs()) + "&recvWindow=10000";
+    const data = await signedFetch(acct, "POST", "/fapi/v1/order", q);
+    if(!(data && data.code===-4061)) return data;
+  }
+  return null;
+}
+async function getPosition(acct, sym, dir){
+  const data = await apiGetPositions(acct);
+  if(!Array.isArray(data)) return null;
+  const wantLong = dir==="long";
+  for(const p of data){
+    if(p.symbol!==sym) continue;
+    const amt = parseFloat(p.positionAmt)||0;
+    if(amt===0) continue;
+    if((wantLong && amt>0) || (!wantLong && amt<0)) return positionInfo(p);
+  }
+  return null;
+}
+
+/* 本地止损单跟踪 */
+const SL_KEY="roi_sl_v1";
+function loadSL(){ try{ return JSON.parse(localStorage.getItem(SL_KEY)||"[]"); }catch(e){ return []; } }
+function saveSL(a){ localStorage.setItem(SL_KEY, JSON.stringify(a)); }
+function newClientAlgoId(){ return "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
+
+async function cancelPosSL(acct, sym, dir){
+  const all = loadSL();
+  const mine = all.filter(x => x.symbol===sym && x.dir===dir);
+  let n=0;
+  for(const it of mine){
+    const q = "clientAlgoId="+encodeURIComponent(it.clientAlgoId) +
+      "&timestamp="+(await nowMs())+"&recvWindow=10000";
+    const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
+    if(!(d && d.code!==undefined)) n++;
+  }
+  if(mine.length) saveSL(all.filter(x => !(x.symbol===sym && x.dir===dir)));
+  return n;
+}
+
+async function setStopLoss(acct, sym, pos, dir){
+  const amtAbs = Math.abs(pos.amt);
+  if(!(pos.unrealized>0) || amtAbs<=0) throw new Error("当前无浮盈，跳过止损设置");
+  const half = pos.unrealized*0.5/amtAbs;
+  const stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  const side = pos.amt>0 ? "SELL" : "BUY";
+  const cands = dir==="long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+  const rule = (await getRules())[sym]||{};
+  const triggerPrice = stopPrice.toFixed(rule.pricePrec||2);
+  const clientAlgoId = newClientAlgoId();
+  let data=null;
+  for(const ps of cands){
+    const q = "algoType=CONDITIONAL&symbol="+sym+"&side="+side +
+      "&type=STOP_MARKET&triggerPrice="+triggerPrice +
+      "&closePosition=true&positionSide="+ps +
+      "&clientAlgoId="+clientAlgoId +
+      "&timestamp="+(await nowMs())+"&recvWindow=10000";
+    data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+    if(!(data && data.code===-4061)) break;
+  }
+  if(data && data.code!==undefined) throw new Error("设止损失败 code "+data.code+": "+(data.msg||""));
+  const all = loadSL();
+  all.push({symbol:sym, dir, clientAlgoId, triggerPrice:stopPrice,
+    created:new Date().toLocaleString("zh-CN",{hour12:false})});
+  saveSL(all);
+  return stopPrice;
+}
+
+/* ============== 刷新 ============== */
+async function refresh(){
+  const accounts = loadKeys().filter(a=>a && a.api_key && a.api_secret);
+  if(!accounts.length){
+    $status.textContent = "请先「设置账户」填写 API Key / Secret。";
+    $tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="big">未配置账户</div>点「设置账户」添加</td></tr>';
+    return;
+  }
+  $status.innerHTML = "正在加载 <span class='loading-dots'></span>";
+  try{
+    await ensureOffset();
+    const rows=[]; const errs=[];
+    for(let ai=0; ai<accounts.length; ai++){
+      const acct = accounts[ai];
+      const name = acctName(acct, ai);
+      let data;
+      try{ data = await apiGetPositions(acct); }
+      catch(e){ errs.push(name+": "+e.message); continue; }
+      if(!Array.isArray(data)){ errs.push(name+": 返回格式异常"); continue; }
+      for(const p of data){
+        const amt = parseFloat(p.positionAmt)||0;
+        if(amt===0) continue;
+        const info = positionInfo(p);
+        if(info.roi < ROI_MIN) continue;
+        rows.push({acctIdx:ai, acctName:name, symbol:p.symbol,
+                   amt:info.amt, roi:info.roi, notional:info.notional});
+      }
+    }
+    rows.sort((a,b)=>b.roi-a.roi);
+    if(!rows.length){
+      $tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="big">当前没有 ROI ≥ '+ROI_MIN+'% 的持仓</div>刷新后自动更新</td></tr>';
+    }else{
+      $tbody.innerHTML = rows.map(r=>{
+        const sideCls = r.amt>0 ? "side-long":"side-short";
+        const sideTxt = r.amt>0 ? "多":"空";
+        const dir    = r.amt>0 ? "long":"short";
+        return '<tr>'+
+          '<td class="acct-name">'+esc(r.acctName)+'</td>'+
+          '<td class="sym">'+r.symbol+'</td>'+
+          '<td class="'+sideCls+'">'+sideTxt+'</td>'+
+          '<td class="num">'+fmtUsd(r.notional)+'</td>'+
+          '<td class="num roi-pos">'+fmtRoi(r.roi)+'</td>'+
+          '<td><button class="add-btn" data-add="'+r.acctIdx+'|'+r.symbol+'|'+dir+'">加仓</button></td>'+
+        '</tr>';
+      }).join("");
+    }
+    const t = new Date().toLocaleTimeString("zh-CN",{hour12:false});
+    $status.textContent = "已加载 "+accounts.length+" 个账户 · "+rows.length+" 条 ROI≥"+ROI_MIN+"% 持仓 · 更新于 "+t;
+    if(errs.length) $status.innerHTML += " · <span style='color:#ef4444'>"+esc(errs.join("；"))+"</span>";
+  }catch(e){
+    $status.textContent = "加载失败："+e.message;
+    $tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="big">加载失败</div>'+esc(e.message)+'</td></tr>';
+  }
+}
+
+/* ============== 加仓主流程 ============== */
+async function addPos(acctIdx, sym, dir){
+  const accounts = loadKeys().filter(a=>a && a.api_key && a.api_secret);
+  const acct = accounts[acctIdx];
+  if(!acct) throw new Error("无账户");
+  const name = acctName(acct, acctIdx);
+  $status.innerHTML = "正在加仓 <span class='loading-dots'></span>";
+  try{
+    await ensureOffset();
+    // 1. 实时校验 ROI
+    const pre = await getPosition(acct, sym, dir);
+    if(!pre) throw new Error("未查到该持仓");
+    if(pre.roi < ROI_MIN) throw new Error("投资回报率 "+pre.roi.toFixed(2)+"% < "+ROI_MIN+"%，不满足加仓条件");
+
+    // 2. 计算数量：默认等量（仓位翻倍），不足 minNotional 时兜底
+    const rule = (await getRules())[sym]||{};
+    let qty = Math.abs(pre.amt);
+    let equalAdd = true;
+    if(pre.notional < rule.minNotional){
+      qty = (rule.minNotional+1)/pre.mark;
+      equalAdd = false;
+    }
+    if(rule.step>0){
+      qty = Math.floor(qty/rule.step)*rule.step;
+      qty = parseFloat(qty.toFixed(10));
+    }
+    if(qty<=0) throw new Error("计算出的加仓数量为 0");
+
+    // 3. 市价加仓
+    const data = await postOrderAuto(acct,
+      "symbol="+sym+"&type=MARKET&quantity="+qty+"&newOrderRespType=ACK", dir);
+    if(data && data.code!==undefined) throw new Error("加仓失败 code "+data.code+": "+(data.msg||""));
+
+    // 4. 撤旧止损 → 挂新止损
+    await new Promise(r=>setTimeout(r,500));
+    const pos = await getPosition(acct, sym, dir);
+    if(!pos) throw new Error("加仓后查询持仓失败");
+    const canceled = await cancelPosSL(acct, sym, dir);
+    const stopPrice = await setStopLoss(acct, sym, pos, dir);
+
+    const note = equalAdd
+      ? "等量加仓"+qty+"（仓位翻倍）"
+      : "当前仓位"+pre.notional.toFixed(2)+"不足最小开仓"+rule.minNotional.toFixed(2)+"，按最小+1";
+    $status.innerHTML = "<b style='color:#22c55e'>["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
+      " 加仓成功："+note+" · 已撤旧止损"+canceled+"单 · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
+      "（浮盈"+fmtUsd(pos.unrealized)+"回撤50%即"+fmtUsd(pos.unrealized*0.5)+"触发）</b>";
+    setTimeout(refresh, 800);
+  }catch(e){
+    $status.innerHTML = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+e.message+"</b>";
+    throw e;
+  }
+}
+
+$tbody.addEventListener("click", async e=>{
+  const btn = e.target.closest("button[data-add]");
+  if(!btn || btn.disabled) return;
+  btn.disabled = true; btn.textContent = "加仓中…";
+  try{
+    const parts = btn.dataset.add.split("|");
+    await addPos(parseInt(parts[0],10), parts[1], parts[2]);
+  }catch(err){}
+  btn.disabled = false; btn.textContent = "加仓";
+});
+
+/* ============== 密钥弹窗 ============== */
+function openKeysModal(){
+  const keys = loadKeys();
+  while(keys.length<1) keys.push({name:"账户1", api_key:"", api_secret:""});
+  const rows = document.getElementById("keyRows");
+  rows.innerHTML = "";
+  keys.forEach((k,i)=>{
+    const row = document.createElement("div");
+    row.className = "key-row";
+    row.innerHTML =
+      '<input data-f="name" placeholder="账户名" value="'+esc(k.name||("账户"+(i+1)))+'">'+
+      '<input data-f="api_key" placeholder="API Key" spellcheck="false" value="'+esc(k.api_key||"")+'">'+
+      '<input data-f="api_secret" placeholder="API Secret" spellcheck="false" value="'+esc(k.api_secret||"")+'">'+
+      '<button class="del" title="删除该账户">✕</button>';
+    rows.appendChild(row);
+  });
+  document.getElementById("keyErr").textContent = "";
+  document.getElementById("overlay").classList.add("show");
+}
+function closeKeysModal(){ document.getElementById("overlay").classList.remove("show"); }
+
+document.getElementById("btnKeys").addEventListener("click", openKeysModal);
+document.getElementById("btnCancel").addEventListener("click", closeKeysModal);
+document.getElementById("btnAddKey").addEventListener("click", ()=>{
+  const rows = document.getElementById("keyRows");
+  const row = document.createElement("div");
+  row.className = "key-row";
+  row.innerHTML =
+    '<input data-f="name" placeholder="账户名" value="账户'+(rows.children.length+1)+'">'+
+    '<input data-f="api_key" placeholder="API Key" spellcheck="false">'+
+    '<input data-f="api_secret" placeholder="API Secret" spellcheck="false">'+
+    '<button class="del" title="删除该账户">✕</button>';
+  rows.appendChild(row);
+});
+document.getElementById("keyRows").addEventListener("click", e=>{
+  if(e.target.classList.contains("del")){
+    if(document.querySelectorAll("#keyRows .key-row").length<=1){
+      document.getElementById("keyErr").textContent = "至少保留 1 个账户"; return;
+    }
+    e.target.closest(".key-row").remove();
+  }
+});
+document.getElementById("btnSave").addEventListener("click", ()=>{
+  const keys=[];
+  document.querySelectorAll("#keyRows .key-row").forEach(row=>{
+    keys.push({
+      name: row.querySelector('[data-f="name"]').value.trim() || ("账户"+(keys.length+1)),
+      api_key: row.querySelector('[data-f="api_key"]').value.trim(),
+      api_secret: row.querySelector('[data-f="api_secret"]').value.trim()
+    });
+  });
+  saveKeys(keys);
+  closeKeysModal();
+  refresh();
+});
+document.getElementById("btnRefresh").addEventListener("click", refresh);
+
+/* ============== 自动执行器 ============== */
+let autoTimer=null, autoRunning=false, cdTimer=null, nextRoundAt=0;
+function startCountdown(seconds){
+  stopCountdown();
+  nextRoundAt = Date.now()+seconds*1000;
+  $cd.style.display = "inline-block";
+  $cd.classList.add("running");
+  cdTimer = setInterval(()=>{
+    const left = Math.max(0, Math.round((nextRoundAt-Date.now())/1000));
+    $cd.innerHTML = left + "<small>s</small>";
+  }, 200);
+}
+function stopCountdown(){
+  if(cdTimer){ clearInterval(cdTimer); cdTimer=null; }
+  $cd.style.display = "none";
+  $cd.classList.remove("running");
+}
+async function autoLoop(){
+  if(!autoRunning) return;
+  try{
+    stopCountdown();
+    await refresh();
+    if(!autoRunning) return;
+    const btns = Array.from(document.querySelectorAll("#tbody button[data-add]"));
+    if(!btns.length) $status.innerHTML += " · <span style='color:var(--sub)'>本轮无可加仓持仓</span>";
+    for(const btn of btns){
+      if(!autoRunning) return;
+      const parts = btn.dataset.add.split("|");
+      const acctIdx = parseInt(parts[0],10), sym=parts[1], dir=parts[2];
+      try{
+        btn.disabled = true; btn.textContent = "加仓中…";
+        $status.innerHTML += " · <span style='color:var(--blue2)'>自动加仓 "+esc(sym)+"…</span>";
+        await addPos(acctIdx, sym, dir);
+      }catch(e){
+        $status.innerHTML += " · <span style='color:#ef4444'>"+esc(sym)+" 跳过："+esc(e.message)+"</span>";
+      }
+      await new Promise(r=>setTimeout(r,1500));
+    }
+    if(autoRunning) $status.innerHTML += " · <span style='color:#22c55e'>本轮完成，10s 后下一轮</span>";
+  }catch(e){
+    $status.innerHTML = "<span style='color:#f5b759'>⚠ 网络中断或接口异常，等待 10s 后自动重试："+esc(e.message)+"</span>";
+  }
+  if(autoRunning){
+    startCountdown(10);
+    autoTimer = setTimeout(autoLoop, 10000);
+  }
+}
+$autoBtn.addEventListener("click", ()=>{
+  if(autoRunning){
+    autoRunning = false;
+    if(autoTimer){ clearTimeout(autoTimer); autoTimer=null; }
+    stopCountdown();
+    $autoBtn.textContent = "▶ 开始自动";
+    $autoBtn.style.background = "";
+    $status.innerHTML += " · <span style='color:var(--sub)'>已停止自动</span>";
+  }else{
+    autoRunning = true;
+    $autoBtn.textContent = "■ 停止自动";
+    $autoBtn.style.background = "linear-gradient(135deg,#a02a2a,#ef4444)";
+    autoLoop();
+  }
+});
+
+/* ============== 网络检测 ============== */
+async function pingNet(){
+  if(navigator.onLine === false){
+    $net.className = "net-ping net-fail"; $net.textContent = "网络连接失败"; return;
+  }
+  try{
+    const ctl = new AbortController();
+    const t = setTimeout(()=>ctl.abort(), 5000);
+    const r = await fetch(FAPI+"/fapi/v1/ping", {method:"GET", signal:ctl.signal});
+    clearTimeout(t);
+    if(r.ok){ $net.className = "net-ping net-ok"; $net.textContent = "网络正常"; }
+    else throw new Error("http "+r.status);
+  }catch(e){
+    $net.className = "net-ping net-fail"; $net.textContent = "网络连接失败";
+  }
+}
+pingNet();
+setInterval(pingNet, 5000);
+window.addEventListener("online", pingNet);
+window.addEventListener("offline", ()=>{ $net.className="net-ping net-fail"; $net.textContent="网络连接失败"; });
+
+/* ============== 启动 ============== */
+$roiSel.value = String(ROI_MIN);
+$roiSel.addEventListener("change", ()=>{ saveRoiMin(parseFloat($roiSel.value)); refresh(); });
+if(loadKeys().some(k=>k && k.api_key && k.api_secret)) refresh();
+</script>
+</body>
+</html>
