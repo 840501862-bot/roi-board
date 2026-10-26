@@ -406,17 +406,43 @@ function loadSL(){ try{ return JSON.parse(localStorage.getItem(SL_KEY)||"[]"); }
 function saveSL(a){ localStorage.setItem(SL_KEY, JSON.stringify(a)); }
 function newClientAlgoId(){ return "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
 
+async function listOpenAlgo(acct, sym){
+  const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder",
+    "symbol="+sym+"&timestamp="+(await nowMs())+"&recvWindow=10000");
+  return Array.isArray(d) ? d : [];
+}
+async function cancelOneAlgo(acct, sym, algo){
+  let idQ = "";
+  if(algo && algo.clientAlgoId) idQ = "clientAlgoId="+encodeURIComponent(algo.clientAlgoId);
+  else if(algo && algo.algoId != null) idQ = "algoId="+algo.algoId;
+  if(!idQ) return false;
+  const q = "symbol="+sym+"&"+idQ+"&timestamp="+(await nowMs())+"&recvWindow=10000";
+  const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
+  return !(d && d.code!==undefined);
+}
 async function cancelPosSL(acct, sym, dir){
   const all = loadSL();
-  const mine = all.filter(x => x.symbol===sym && x.dir===dir);
+  const wantSide = dir==="long" ? "SELL" : "BUY";
+  const removed = [];
   let n=0;
-  for(const it of mine){
-    const q = "clientAlgoId="+encodeURIComponent(it.clientAlgoId) +
-      "&timestamp="+(await nowMs())+"&recvWindow=10000";
-    const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
-    if(!(d && d.code!==undefined)) n++;
+  // 1) 服务端扫描：撤掉该交易对上所有由本工具创建的平仓止损条件单（closePosition + STOP_MARKET + 同方向）
+  //    不再只依赖本地记录，避免记录丢失时旧止损残留、新止损被币安限制拒单
+  try{
+    const open = await listOpenAlgo(acct, sym);
+    for(const o of open){
+      if(String(o.closePosition)!=="true") continue;
+      if(String(o.type)!=="STOP_MARKET") continue;
+      if(String(o.side)!==wantSide) continue;
+      if(await cancelOneAlgo(acct, sym, o)){ n++; if(o.clientAlgoId) removed.push(o.clientAlgoId); }
+    }
+  }catch(e){}
+  // 2) 本地记录兜底（服务端扫描失败或订单未在列表中时）
+  for(const it of all){
+    if(!(it.symbol===sym && it.dir===dir)) continue;
+    if(removed.indexOf(it.clientAlgoId)>=0) continue;
+    try{ if(await cancelOneAlgo(acct, sym, it)) n++; }catch(e){}
   }
-  if(mine.length) saveSL(all.filter(x => !(x.symbol===sym && x.dir===dir)));
+  if(all.length) saveSL(all.filter(x => !(x.symbol===sym && x.dir===dir)));
   return n;
 }
 
@@ -424,28 +450,43 @@ async function setStopLoss(acct, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if(!(pos.unrealized>0) || amtAbs<=0) throw new Error("当前无浮盈，跳过止损设置");
   const half = pos.unrealized*0.5/amtAbs;
-  const stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  const rule = (await getRules())[sym]||{};
+  const prec = rule.pricePrec||2;
   const side = pos.amt>0 ? "SELL" : "BUY";
   const cands = dir==="long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
-  const rule = (await getRules())[sym]||{};
-  const triggerPrice = stopPrice.toFixed(rule.pricePrec||2);
-  const clientAlgoId = newClientAlgoId();
-  let data=null;
-  for(const ps of cands){
-    const q = "algoType=CONDITIONAL&symbol="+sym+"&side="+side +
-      "&type=STOP_MARKET&triggerPrice="+triggerPrice +
-      "&closePosition=true&positionSide="+ps +
-      "&clientAlgoId="+clientAlgoId +
-      "&timestamp="+(await nowMs())+"&recvWindow=10000";
-    data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
-    if(!(data && data.code===-4061)) break;
+  let stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  let lastErr = null;
+  // 最多尝试 2 次：-2021/-4004（触发价会立即触发）时把触发价再推远 0.5% 重试
+  for(let attempt=0; attempt<2; attempt++){
+    const clientAlgoId = newClientAlgoId();
+    const triggerPrice = stopPrice.toFixed(prec);
+    let data=null;
+    for(const ps of cands){
+      const q = "algoType=CONDITIONAL&symbol="+sym+"&side="+side +
+        "&type=STOP_MARKET&triggerPrice="+triggerPrice +
+        "&closePosition=true&positionSide="+ps +
+        "&clientAlgoId="+clientAlgoId +
+        "&timestamp="+(await nowMs())+"&recvWindow=10000";
+      data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+      if(!(data && data.code===-4061)) break;
+    }
+    if(data && data.code!==undefined){
+      lastErr = data;
+      if(data.code===-2021 || data.code===-4004){
+        const buf = pos.mark*0.005;
+        stopPrice = pos.amt>0 ? pos.mark-buf : pos.mark+buf;
+        continue;
+      }
+      break;
+    }
+    const all = loadSL();
+    all.push({symbol:sym, dir, clientAlgoId, triggerPrice:stopPrice,
+      created:new Date().toLocaleString("zh-CN",{hour12:false})});
+    saveSL(all);
+    return stopPrice;
   }
-  if(data && data.code!==undefined) throw new Error("设止损失败 code "+data.code+": "+(data.msg||""));
-  const all = loadSL();
-  all.push({symbol:sym, dir, clientAlgoId, triggerPrice:stopPrice,
-    created:new Date().toLocaleString("zh-CN",{hour12:false})});
-  saveSL(all);
-  return stopPrice;
+  if(lastErr) throw new Error("设止损失败 code "+lastErr.code+": "+(lastErr.msg||""));
+  throw new Error("设止损失败（未知错误）");
 }
 
 /* ============== 刷新 ============== */
@@ -536,12 +577,24 @@ async function addPos(acctIdx, sym, dir){
       "symbol="+sym+"&type=MARKET&quantity="+qty+"&newOrderRespType=ACK", dir);
     if(data && data.code!==undefined) throw new Error("加仓失败 code "+data.code+": "+(data.msg||""));
 
-    // 4. 撤旧止损 → 挂新止损
+    // 4. 撤旧止损 → 挂新止损（新止损设置失败时自动重试一次；旧止损已可正常撤销，不再残留）
     await new Promise(r=>setTimeout(r,500));
     const pos = await getPosition(acct, sym, dir);
-    if(!pos) throw new Error("加仓后查询持仓失败");
+    if(!pos) throw new Error("加仓已成交，但加仓后查询持仓失败，请手动确认仓位与止损");
     const canceled = await cancelPosSL(acct, sym, dir);
-    const stopPrice = await setStopLoss(acct, sym, pos, dir);
+    let stopPrice;
+    try{
+      stopPrice = await setStopLoss(acct, sym, pos, dir);
+    }catch(e){
+      await new Promise(r=>setTimeout(r,400));
+      const pos2 = await getPosition(acct, sym, dir);
+      if(!pos2) throw new Error("加仓已成交；旧止损已撤销("+canceled+"单)，但新止损设置失败："+e.message+" —— 请立即手动设置止损");
+      try{
+        stopPrice = await setStopLoss(acct, sym, pos2, dir);
+      }catch(e2){
+        throw new Error("加仓已成交；旧止损已撤销("+canceled+"单)，新止损重试仍失败："+e2.message+" —— 请立即手动设置止损");
+      }
+    }
 
     const note = equalAdd
       ? "等量加仓"+qty+"（仓位翻倍）"
