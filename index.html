@@ -433,17 +433,29 @@ async function cancelPosSL(acct, sym, dir){
   const wantSide = dir==="long" ? "SELL" : "BUY";
   const removed = [];
   let n=0;
-  // 1) 服务端扫描：撤掉该交易对上所有由本工具创建的平仓止损条件单（closePosition + STOP_MARKET + 同方向）
-  //    不再只依赖本地记录，避免记录丢失时旧止损残留、新止损被币安限制拒单
-  try{
-    const open = await listOpenAlgo(acct, sym);
+  // 1) 服务端扫描 + 校验：撤掉该交易对同方向上所有平仓止损条件单
+  //    覆盖 STOP_MARKET 与 TRAILING_STOP_MARKET（APP 里的追踪止损），
+  //    最多 3 轮，每轮撤销后重新查询校验，确保旧止损真正撤干净，
+  //    避免币安「同方向只允许一个 closePosition 条件单」(-4130) 拒掉新止损。
+  for(let round=0; round<3; round++){
+    let open = [];
+    try{ open = await listOpenAlgo(acct, sym); }catch(e){}
+    let roundHit = false;
     for(const o of open){
-      if(String(o.closePosition)!=="true") continue;
-      if(String(o.type)!=="STOP_MARKET") continue;
+      const type = String(o.type||"");
+      if(type!=="STOP_MARKET" && type!=="TRAILING_STOP_MARKET") continue;
       if(String(o.side)!==wantSide) continue;
-      if(await cancelOneAlgo(acct, sym, o)){ n++; if(o.clientAlgoId) removed.push(o.clientAlgoId); }
+      const isClose = String(o.closePosition)==="true" ||
+                      (o.closePosition===undefined && String(o.reduceOnly)==="true");
+      if(!isClose) continue;
+      if(await cancelOneAlgo(acct, sym, o)){
+        n++; roundHit = true;
+        if(o.clientAlgoId) removed.push(o.clientAlgoId);
+      }
     }
-  }catch(e){}
+    if(!roundHit) break;
+    await new Promise(r=>setTimeout(r,300));
+  }
   // 2) 本地记录兜底（服务端扫描失败或订单未在列表中时）
   for(const it of all){
     if(!(it.symbol===sym && it.dir===dir)) continue;
@@ -474,6 +486,7 @@ async function setStopLoss(acct, sym, pos, dir){
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
   let lastErr = null;
+  let forcedCancel = 0;
   // 最多尝试 2 次：-2021/-4004（触发价距现价过近会立即触发）时把触发价推远 0.5% 重试；
   // 但推远后的触发价不允许越过入场价（多单不低于入场价×1.001、空单不高于入场价×0.999），
   // 保证任何情况下都不会挂出“触发即亏损”的止损。
@@ -502,6 +515,18 @@ async function setStopLoss(acct, sym, pos, dir){
           stopPrice = Math.min(pos.mark+buf, ceil);
         }
         continue;
+      }
+      // 币安限制：同方向只能存在一个 closePosition 条件单（-4130 等）——
+      // 立即强制撤销旧止损并校验，再原地重试，避免“旧止损没撤掉 → 新止损被拒”。
+      if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
+        if(forcedCancel<2){
+          forcedCancel++;
+          try{ await cancelPosSL(acct, sym, dir); }catch(e){}
+          await new Promise(r=>setTimeout(r,300));
+          attempt--;
+          continue;
+        }
+        break;
       }
       break;
     }
@@ -613,13 +638,18 @@ async function addPos(acctIdx, sym, dir){
     try{
       stopPrice = await setStopLoss(acct, sym, pos, dir);
     }catch(e){
+      // 失败多半是旧止损没撤干净（币安同方向只允许一个 closePosition 条件单，报 -4130 等）：
+      // 再强制撤销一遍并校验，然后重试挂新止损
       await new Promise(r=>setTimeout(r,400));
+      let canceled2 = 0;
+      try{ canceled2 = await cancelPosSL(acct, sym, dir); }catch(e3){}
+      await new Promise(r=>setTimeout(r,300));
       const pos2 = await getPosition(acct, sym, dir);
-      if(!pos2) throw new Error("加仓已成交；旧止损已撤销("+canceled+"单)，但新止损设置失败："+e.message+" —— 请立即手动设置止损");
+      if(!pos2) throw new Error("加仓已成交；旧止损已撤销("+(canceled+canceled2)+"单)，但新止损设置失败："+e.message+" —— 请立即手动设置止损");
       try{
         stopPrice = await setStopLoss(acct, sym, pos2, dir);
       }catch(e2){
-        throw new Error("加仓已成交；旧止损已撤销("+canceled+"单)，新止损重试仍失败："+e2.message+" —— 请立即手动设置止损");
+        throw new Error("加仓已成交；旧止损已撤销("+(canceled+canceled2)+"单)，新止损重试仍失败："+e2.message+" —— 请立即手动设置止损");
       }
     }
 
