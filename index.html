@@ -216,6 +216,7 @@ function saveRoiMin(v){ ROI_MIN = v; try{ localStorage.setItem("roi_min_v1", Str
 
 function esc(s){ return String(s == null ? "" : s)
   .replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
 
 /* 5倍杠杆账户 ROI 等比换算：实际 7.5% = 正常 100% */
 const LEV5_SCALE = 100/7.5;
@@ -391,6 +392,38 @@ async function postOrderAuto(acct, baseQuery, wantDir){
   }
   return null;
 }
+/* 市价加仓（带网络自愈）：请求超时/网络错误时先查持仓确认是否已成交，
+   成交了就视为成功（不重复下），没成交才重试；限流/繁忙则退避后重试 */
+async function postOrderAutoRobust(acct, sym, dir, qty, preAmt){
+  const baseQuery = "symbol="+sym+"&type=MARKET&quantity="+qty+"&newOrderRespType=ACK";
+  for(let attempt=0; attempt<4; attempt++){
+    let data=null, netErr=null;
+    try{ data = await postOrderAuto(acct, baseQuery, dir); }catch(e){ netErr=e; }
+    if(data===null){
+      throw new Error("加仓失败：positionSide 无法匹配（-4061）");
+    }
+    if(data && data.code!==undefined){
+      if(data.code===-1003 || data.code===-1015 || data.code===-1004){
+        await sleep(1500*(attempt+1)); continue;      // 限流/服务繁忙 → 退避重试
+      }
+      if(data.code===-1021){ await ensureOffset(); await sleep(500); continue; }
+      throw new Error("加仓失败 code "+data.code+": "+(data.msg||""));
+    }
+    if(netErr){
+      // 网络/超时：无法确认是否成交 → 查持仓确认，避免重复加仓或漏掉加仓
+      await sleep(1000);
+      let posNow=null;
+      try{ posNow = await getPosition(acct, sym, dir); }catch(e){}
+      if(posNow && Math.abs(posNow.amt) >= Math.abs(preAmt)+Math.abs(qty)*0.5){
+        return {filled:true, acked:false};             // 其实已成交
+      }
+      await sleep(1000);
+      continue;
+    }
+    return {filled:true, acked:true};                  // 服务端已确认成交
+  }
+  throw new Error("加仓请求多次网络超时且无法确认是否成交——请立即在币安确认仓位，若已加仓请手动补设止损");
+}
 async function getPosition(acct, sym, dir){
   const data = await apiGetPositions(acct);
   if(!Array.isArray(data)) return null;
@@ -433,30 +466,39 @@ async function cancelPosSL(acct, sym, dir){
   const wantSide = dir==="long" ? "SELL" : "BUY";
   const removed = [];
   let n=0;
-  // 1) 服务端扫描 + 校验：撤掉该交易对同方向上所有平仓止损条件单
-  //    覆盖 STOP_MARKET 与 TRAILING_STOP_MARKET（APP 里的追踪止损），
-  //    最多 3 轮，每轮撤销后重新查询校验，确保旧止损真正撤干净，
-  //    避免币安「同方向只允许一个 closePosition 条件单」(-4130) 拒掉新止损。
-  for(let round=0; round<3; round++){
-    let open = [];
-    try{ open = await listOpenAlgo(acct, sym); }catch(e){}
-    let roundHit = false;
-    for(const o of open){
-      const type = String(o.type||"");
-      if(type!=="STOP_MARKET" && type!=="TRAILING_STOP_MARKET") continue;
-      if(String(o.side)!==wantSide) continue;
-      const isClose = String(o.closePosition)==="true" ||
-                      (o.closePosition===undefined && String(o.reduceOnly)==="true");
-      if(!isClose) continue;
+  const matches = o => {
+    const type = String(o.type||"");
+    if(type!=="STOP_MARKET" && type!=="TRAILING_STOP_MARKET") return false;
+    if(String(o.side)!==wantSide) return false;
+    const isClose = String(o.closePosition)==="true" ||
+                    (o.closePosition===undefined && String(o.reduceOnly)==="true");
+    return isClose;
+  };
+  // 服务端扫描撤销，撤到确认同方向止损清空为止（最多4轮）；
+  // 列表查询失败（网络抖动）会重试，确保旧止损真正被撤掉，
+  // 新止损才不会被币安「同方向只允许一个 closePosition 条件单」(-4130) 拒绝
+  for(let round=0; round<4; round++){
+    let open=[];
+    let listOk=false;
+    for(let listTry=0; listTry<3; listTry++){
+      try{ open = await listOpenAlgo(acct, sym); listOk=true; break; }catch(e){
+        await sleep(700*(listTry+1));
+      }
+    }
+    if(!listOk){ await sleep(800); continue; }
+    const targets = open.filter(matches);
+    if(!targets.length) break;                       // 已清空
+    let roundHit=false;
+    for(const o of targets){
       if(await cancelOneAlgo(acct, sym, o)){
-        n++; roundHit = true;
+        n++; roundHit=true;
         if(o.clientAlgoId) removed.push(o.clientAlgoId);
       }
     }
-    if(!roundHit) break;
-    await new Promise(r=>setTimeout(r,300));
+    if(!roundHit) await sleep(600);
+    await sleep(400);
   }
-  // 2) 本地记录兜底（服务端扫描失败或订单未在列表中时）
+  // 本地记录兜底（服务端扫描失败或订单未在列表中时）
   for(const it of all){
     if(!(it.symbol===sym && it.dir===dir)) continue;
     if(removed.indexOf(it.clientAlgoId)>=0) continue;
@@ -485,58 +527,81 @@ async function setStopLoss(acct, sym, pos, dir){
     const half = pos.unrealized*0.5/amtAbs;
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
+  // 【稳定性保障】挂新止损最多重试 8 次、退避递增：
+  //  - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
+  //  - 限流/繁忙(-1003/-1015/-1004)：等待后重试
+  //  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
+  //    （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999，
+  //      保证任何情况下都不会挂出“触发即亏损”的止损）
+  //  - -4130（同方向已存在 closePosition 条件单）：先强制撤干净旧止损并校验，再原地重试
+  //  - 其余错误：退避后重试
+  const BACKOFF = [600,1000,1500,2500,3500,5000,5000];
   let lastErr = null;
-  let forcedCancel = 0;
-  // 最多尝试 2 次：-2021/-4004（触发价距现价过近会立即触发）时把触发价推远 0.5% 重试；
-  // 但推远后的触发价不允许越过入场价（多单不低于入场价×1.001、空单不高于入场价×0.999），
-  // 保证任何情况下都不会挂出“触发即亏损”的止损。
-  for(let attempt=0; attempt<2; attempt++){
+  for(let attempt=0; attempt<8; attempt++){
     const clientAlgoId = newClientAlgoId();
     const triggerPrice = stopPrice.toFixed(prec);
-    let data=null;
+    let outcome = "error";                             // "placed" | "error"
     for(const ps of cands){
-      const q = "algoType=CONDITIONAL&symbol="+sym+"&side="+side +
-        "&type=STOP_MARKET&triggerPrice="+triggerPrice +
-        "&closePosition=true&positionSide="+ps +
-        "&clientAlgoId="+clientAlgoId +
-        "&timestamp="+(await nowMs())+"&recvWindow=10000";
-      data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
-      if(!(data && data.code===-4061)) break;
-    }
-    if(data && data.code!==undefined){
-      lastErr = data;
-      if(data.code===-2021 || data.code===-4004){
-        const buf = pos.mark*0.005;
-        if(pos.amt>0){
-          const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
-          stopPrice = Math.max(pos.mark-buf, floor);
-        }else{
-          const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
-          stopPrice = Math.min(pos.mark+buf, ceil);
-        }
-        continue;
+      let data=null, netErr=null;
+      try{
+        const q = "algoType=CONDITIONAL&symbol="+sym+"&side="+side +
+          "&type=STOP_MARKET&triggerPrice="+triggerPrice +
+          "&closePosition=true&positionSide="+ps +
+          "&clientAlgoId="+clientAlgoId +
+          "&timestamp="+(await nowMs())+"&recvWindow=10000";
+        data = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+      }catch(e){ netErr=e; }
+      if(netErr){
+        lastErr = netErr;
+        await sleep(800);
+        try{
+          const open = await listOpenAlgo(acct, sym);
+          if(open.find(o => String(o.clientAlgoId)===clientAlgoId ||
+             (String(o.type)==="STOP_MARKET" && String(o.side)===side && String(o.closePosition)==="true"))){
+            outcome = "placed";                          // 超时但其实已挂上
+          }
+        }catch(e){}
+        break;                                           // 网络错误 → 退避后整轮重试
       }
-      // 币安限制：同方向只能存在一个 closePosition 条件单（-4130 等）——
-      // 立即强制撤销旧止损并校验，再原地重试，避免“旧止损没撤掉 → 新止损被拒”。
-      if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
-        if(forcedCancel<2){
-          forcedCancel++;
+      if(data && data.code!==undefined){
+        lastErr = data;
+        if(data.code===-4061){ continue; }               // 换 positionSide
+        if(data.code===-1021){ await ensureOffset(); break; }
+        if(data.code===-2021 || data.code===-4004){      // 触发价太近 → 推远 0.5%（不许越过入场价）
+          const buf = pos.mark*0.005;
+          if(pos.amt>0){
+            const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
+            stopPrice = Math.max(pos.mark-buf, floor);
+          }else{
+            const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
+            stopPrice = Math.min(pos.mark+buf, ceil);
+          }
+          break;
+        }
+        if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
+          // 旧止损没撤干净 → 强制撤干净并校验，再原地重试
           try{ await cancelPosSL(acct, sym, dir); }catch(e){}
-          await new Promise(r=>setTimeout(r,300));
-          attempt--;
-          continue;
+          await sleep(500);
+          break;
         }
-        break;
+        break;                                           // 其他错误（限流/繁忙等）→ 退避重试
       }
+      outcome = "placed";                                // 服务端已返回成功
       break;
     }
-    const all = loadSL();
-    all.push({symbol:sym, dir, clientAlgoId, triggerPrice:stopPrice,
-      created:new Date().toLocaleString("zh-CN",{hour12:false})});
-    saveSL(all);
-    return stopPrice;
+    if(outcome === "placed"){
+      const all = loadSL();
+      all.push({symbol:sym, dir, clientAlgoId, triggerPrice:stopPrice,
+        created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      saveSL(all);
+      return stopPrice;
+    }
+    if(attempt<7) await sleep(BACKOFF[attempt]);
   }
-  if(lastErr) throw new Error("设止损失败 code "+lastErr.code+": "+(lastErr.msg||""));
+  if(lastErr){
+    if(lastErr && lastErr.code!==undefined) throw new Error("设止损失败 code "+lastErr.code+": "+(lastErr.msg||""));
+    throw new Error("设止损失败："+((lastErr&&lastErr.message)||"网络错误")+"（已重试8次）");
+  }
   throw new Error("设止损失败（未知错误）");
 }
 
@@ -624,33 +689,39 @@ async function addPos(acctIdx, sym, dir){
     }
     if(qty<=0) throw new Error("计算出的加仓数量为 0");
 
-    // 3. 市价加仓
-    const data = await postOrderAuto(acct,
-      "symbol="+sym+"&type=MARKET&quantity="+qty+"&newOrderRespType=ACK", dir);
-    if(data && data.code!==undefined) throw new Error("加仓失败 code "+data.code+": "+(data.msg||""));
+    // 3. 市价加仓（网络超时也会查持仓确认是否已成交，绝不盲目重下）
+    $status.innerHTML = "正在市价加仓 "+sym+" <span class='loading-dots'></span>";
+    const filled = await postOrderAutoRobust(acct, sym, dir, qty, pre.amt);
+    if(!filled.filled) throw new Error("加仓未成交（网络异常且持仓无变化）");
 
-    // 4. 撤旧止损 → 挂新止损（新止损设置失败时自动重试一次；旧止损已可正常撤销，不再残留）
-    await new Promise(r=>setTimeout(r,500));
-    const pos = await getPosition(acct, sym, dir);
-    if(!pos) throw new Error("加仓已成交，但加仓后查询持仓失败，请手动确认仓位与止损");
-    const canceled = await cancelPosSL(acct, sym, dir);
-    let stopPrice;
-    try{
-      stopPrice = await setStopLoss(acct, sym, pos, dir);
-    }catch(e){
-      // 失败多半是旧止损没撤干净（币安同方向只允许一个 closePosition 条件单，报 -4130 等）：
-      // 再强制撤销一遍并校验，然后重试挂新止损
-      await new Promise(r=>setTimeout(r,400));
-      let canceled2 = 0;
-      try{ canceled2 = await cancelPosSL(acct, sym, dir); }catch(e3){}
-      await new Promise(r=>setTimeout(r,300));
-      const pos2 = await getPosition(acct, sym, dir);
-      if(!pos2) throw new Error("加仓已成交；旧止损已撤销("+(canceled+canceled2)+"单)，但新止损设置失败："+e.message+" —— 请立即手动设置止损");
+    // 4. 【核心保障】撤旧止损 → 挂新止损，多轮循环重试直到服务端确认成功；
+    //    加仓已成交，这一步慢也一定要完成：最多 4 轮，每轮内部再各自重试，
+    //    速度慢优先保证“加完仓设止损成功”
+    $status.innerHTML = "加仓已成交，正在撤销旧止损并挂新止损 <span class='loading-dots'></span>";
+    await sleep(600);
+    let pos=null;
+    for(let t=0; t<3 && !pos; t++){
+      try{ pos = await getPosition(acct, sym, dir); }catch(e){}
+      if(!pos) await sleep(800);
+    }
+    if(!pos) throw new Error("加仓已成交，但持仓查询多次失败——请立即手动确认仓位并设置止损");
+
+    let stopPrice=null, lastErr=null;
+    for(let round=0; round<4; round++){
+      $status.innerHTML = "["+esc(name)+"] "+sym+" 加仓已成交 · 撤旧止损/挂新止损 第"+(round+1)+"轮 <span class='loading-dots'></span>";
       try{
-        stopPrice = await setStopLoss(acct, sym, pos2, dir);
-      }catch(e2){
-        throw new Error("加仓已成交；旧止损已撤销("+(canceled+canceled2)+"单)，新止损重试仍失败："+e2.message+" —— 请立即手动设置止损");
+        pos = await getPosition(acct, sym, dir);
+        if(!pos) throw new Error("持仓查询失败");
+        await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
+        stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试8次）
+        break;
+      }catch(e){
+        lastErr = e;
+        await sleep([1000,1500,2500,4000][round]);
       }
+    }
+    if(stopPrice===null){
+      throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（"+((lastErr&&lastErr.message)||"未知错误")+"）——请立即手动设置止损！");
     }
 
     const note = equalAdd
