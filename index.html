@@ -106,7 +106,7 @@
   }
   .modal h3 { font-size:16px; margin-bottom:4px; }
   .modal .m-sub { font-size:12px; color:var(--sub); margin-bottom:14px; }
-  .key-row { display:grid; grid-template-columns:96px 1fr 1fr 30px; gap:8px; margin-bottom:10px; align-items:center; }
+  .key-row { display:grid; grid-template-columns:96px 1fr 1fr 56px 30px; gap:8px; margin-bottom:10px; align-items:center; }
   .key-row input {
     width:100%; background:#0a1020; border:1px solid var(--line); border-radius:8px;
     color:var(--txt); padding:8px 10px; font-size:12px; font-family:Consolas,monospace; outline:none;
@@ -216,6 +216,10 @@ function saveRoiMin(v){ ROI_MIN = v; try{ localStorage.setItem("roi_min_v1", Str
 
 function esc(s){ return String(s == null ? "" : s)
   .replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;"); }
+
+/* 5倍杠杆账户 ROI 等比换算：实际 7.5% = 正常 100% */
+const LEV5_SCALE = 100/7.5;
+function scaleRoi(acct, roi){ return (acct && acct.is5x) ? roi*LEV5_SCALE : roi; }
 
 /* ============== SHA-256 / HMAC（纯 JS 兜底） ============== */
 function _bytesToHex(b){ return Array.from(b).map(x=>x.toString(16).padStart(2,"0")).join(""); }
@@ -395,7 +399,11 @@ async function getPosition(acct, sym, dir){
     if(p.symbol!==sym) continue;
     const amt = parseFloat(p.positionAmt)||0;
     if(amt===0) continue;
-    if((wantLong && amt>0) || (!wantLong && amt<0)) return positionInfo(p);
+    if((wantLong && amt>0) || (!wantLong && amt<0)){
+      const info = positionInfo(p);
+      info.roi = scaleRoi(acct, info.roi);
+      return info;
+    }
   }
   return null;
 }
@@ -512,9 +520,10 @@ async function refresh(){
         const amt = parseFloat(p.positionAmt)||0;
         if(amt===0) continue;
         const info = positionInfo(p);
-        if(info.roi < ROI_MIN) continue;
-        rows.push({acctIdx:ai, acctName:name, symbol:p.symbol,
-                   amt:info.amt, roi:info.roi, notional:info.notional});
+        const roi = scaleRoi(acct, info.roi);
+        if(roi < ROI_MIN) continue;
+        rows.push({acctIdx:ai, acctName:name, is5x:!!acct.is5x, symbol:p.symbol,
+                   amt:info.amt, roi:roi, notional:info.notional});
       }
     }
     rows.sort((a,b)=>b.roi-a.roi);
@@ -526,7 +535,7 @@ async function refresh(){
         const sideTxt = r.amt>0 ? "多":"空";
         const dir    = r.amt>0 ? "long":"short";
         return '<tr>'+
-          '<td class="acct-name">'+esc(r.acctName)+'</td>'+
+          '<td class="acct-name">'+esc(r.acctName)+(r.is5x?' <span style="font-size:10px;background:#7c3aed;color:#fff;padding:1px 5px;border-radius:4px;margin-left:4px">5x</span>':'')+'</td>'+
           '<td class="sym">'+r.symbol+'</td>'+
           '<td class="'+sideCls+'">'+sideTxt+'</td>'+
           '<td class="num">'+fmtUsd(r.notional)+'</td>'+
@@ -633,6 +642,7 @@ function openKeysModal(){
       '<input data-f="name" placeholder="账户名" value="'+esc(k.name||("账户"+(i+1)))+'">'+
       '<input data-f="api_key" placeholder="API Key" spellcheck="false" value="'+esc(k.api_key||"")+'">'+
       '<input data-f="api_secret" placeholder="API Secret" spellcheck="false" value="'+esc(k.api_secret||"")+'">'+
+      '<label style="font-size:11px;color:var(--sub);text-align:center;cursor:pointer" title="勾选后ROI按7.5%=100%等比缩放"><input type="checkbox" data-f="is5x" '+(k.is5x?'checked':'')+' style="vertical-align:middle;cursor:pointer"> 5倍</label>'+
       '<button class="del" title="删除该账户">✕</button>';
     rows.appendChild(row);
   });
@@ -651,6 +661,7 @@ document.getElementById("btnAddKey").addEventListener("click", ()=>{
     '<input data-f="name" placeholder="账户名" value="账户'+(rows.children.length+1)+'">'+
     '<input data-f="api_key" placeholder="API Key" spellcheck="false">'+
     '<input data-f="api_secret" placeholder="API Secret" spellcheck="false">'+
+    '<label style="font-size:11px;color:var(--sub);text-align:center;cursor:pointer" title="勾选后ROI按7.5%=100%等比缩放"><input type="checkbox" data-f="is5x" style="vertical-align:middle;cursor:pointer"> 5倍</label>'+
     '<button class="del" title="删除该账户">✕</button>';
   rows.appendChild(row);
 });
@@ -668,7 +679,8 @@ document.getElementById("btnSave").addEventListener("click", ()=>{
     keys.push({
       name: row.querySelector('[data-f="name"]').value.trim() || ("账户"+(keys.length+1)),
       api_key: row.querySelector('[data-f="api_key"]').value.trim(),
-      api_secret: row.querySelector('[data-f="api_secret"]').value.trim()
+      api_secret: row.querySelector('[data-f="api_secret"]').value.trim(),
+      is5x: row.querySelector('[data-f="is5x"]').checked
     });
   });
   saveKeys(keys);
