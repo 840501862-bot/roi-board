@@ -346,7 +346,7 @@ function positionInfo(p){
   }
   const roi = margin>0 ? unrealized/margin*100 : 0;
   const notional = Math.abs(amt)*mark;
-  return {amt, mark, unrealized, roi, notional};
+  return {amt, mark, unrealized, roi, notional, entry: parseFloat(p.entryPrice)||0};
 }
 function fmtRoi(v){ return (v>=0?"+":"") + v.toFixed(2) + "%"; }
 function fmtUsd(v){ return "$" + Math.abs(v).toLocaleString("en-US",{maximumFractionDigits:2}); }
@@ -457,14 +457,26 @@ async function cancelPosSL(acct, sym, dir){
 async function setStopLoss(acct, sym, pos, dir){
   const amtAbs = Math.abs(pos.amt);
   if(!(pos.unrealized>0) || amtAbs<=0) throw new Error("当前无浮盈，跳过止损设置");
-  const half = pos.unrealized*0.5/amtAbs;
   const rule = (await getRules())[sym]||{};
   const prec = rule.pricePrec||2;
   const side = pos.amt>0 ? "SELL" : "BUY";
   const cands = dir==="long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
-  let stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  // 止损价 = 入场均价 + 当前浮盈的 50%（多单示例）：
+  //   多单：入场价 + (现价-入场价)×0.5；空单：入场价 - (入场价-现价)×0.5
+  // 止损价永远夹在入场均价与现价之间：无论加仓几次、均价如何被抬高，
+  // 每次挂出的止损都严格锁定当前浮盈的一半，绝不会低于入场价（多单）/高于入场价（空单），杜绝“止损即亏损”。
+  let stopPrice;
+  if(pos.entry>0){
+    const profitPerUnit = pos.amt>0 ? (pos.mark-pos.entry) : (pos.entry-pos.mark);
+    stopPrice = pos.amt>0 ? (pos.entry+profitPerUnit*0.5) : (pos.entry-profitPerUnit*0.5);
+  }else{
+    const half = pos.unrealized*0.5/amtAbs;
+    stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
+  }
   let lastErr = null;
-  // 最多尝试 2 次：-2021/-4004（触发价会立即触发）时把触发价再推远 0.5% 重试
+  // 最多尝试 2 次：-2021/-4004（触发价距现价过近会立即触发）时把触发价推远 0.5% 重试；
+  // 但推远后的触发价不允许越过入场价（多单不低于入场价×1.001、空单不高于入场价×0.999），
+  // 保证任何情况下都不会挂出“触发即亏损”的止损。
   for(let attempt=0; attempt<2; attempt++){
     const clientAlgoId = newClientAlgoId();
     const triggerPrice = stopPrice.toFixed(prec);
@@ -482,7 +494,13 @@ async function setStopLoss(acct, sym, pos, dir){
       lastErr = data;
       if(data.code===-2021 || data.code===-4004){
         const buf = pos.mark*0.005;
-        stopPrice = pos.amt>0 ? pos.mark-buf : pos.mark+buf;
+        if(pos.amt>0){
+          const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
+          stopPrice = Math.max(pos.mark-buf, floor);
+        }else{
+          const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
+          stopPrice = Math.min(pos.mark+buf, ceil);
+        }
         continue;
       }
       break;
