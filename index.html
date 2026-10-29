@@ -145,6 +145,19 @@
   }
   .countdown small { font-size:12px; color:var(--sub); margin-left:2px; }
   .countdown.running { color:#22c55e; border-color:#22c55e; box-shadow:0 0 12px rgba(34,197,94,.4); }
+
+  .exec-log {
+    margin:10px auto 0; max-width:960px; max-height:260px; overflow-y:auto;
+    background:rgba(10,14,26,.55); border:1px solid var(--line); border-radius:10px;
+    padding:8px 12px; font-size:12px;
+  }
+  .exec-title { color:var(--sub); margin-bottom:6px; font-size:12px; }
+  .log-line { padding:3px 0; border-bottom:1px dashed rgba(255,255,255,.06); word-break:break-all; line-height:1.5; }
+  .log-line:last-child { border-bottom:none; }
+  .log-ok { color:#22c55e; }
+  .log-err { color:#ef4444; }
+  .log-warn { color:#f5b759; }
+  .log-time { color:var(--sub); margin-right:8px; font-family:Consolas,"Courier New",monospace; }
 </style>
 </head>
 <body>
@@ -172,6 +185,8 @@
   <button id="btnRefresh">⟳ 刷新数据</button>
   <button id="btnAuto">▶ 开始自动</button>
 </div>
+
+<div id="execLog" class="exec-log"><div class="exec-title">执行记录（成功/失败各占一行）</div></div>
 
 <div class="tbl-wrap">
   <table>
@@ -207,6 +222,19 @@ const $net      = document.getElementById("netStatus");
 const $cd       = document.getElementById("countdown");
 const $autoBtn  = document.getElementById("btnAuto");
 const $roiSel   = document.getElementById("roiFilter");
+const $execLog  = document.getElementById("execLog");
+
+/* 执行记录：成功/失败各占一行（最多保留 60 条，超出自动清理最早记录） */
+const LOG_MAX = 60;
+function addLog(html, cls){
+  if(!$execLog) return;
+  const line = document.createElement("div");
+  line.className = "log-line "+(cls||"");
+  line.innerHTML = "<span class='log-time'>"+new Date().toLocaleTimeString("zh-CN",{hour12:false})+"</span>"+html;
+  $execLog.appendChild(line);
+  while($execLog.children.length > LOG_MAX+1){ $execLog.removeChild($execLog.children[1]); }
+  $execLog.scrollTop = $execLog.scrollHeight;
+}
 
 let ROI_MIN = (() => {
   const v = parseFloat(localStorage.getItem("roi_min_v1") || "100");
@@ -969,11 +997,12 @@ async function doAddPos(acctIdx, sym, dir){
       ? "加仓数量低于系统最小要求，按最小加仓数量"+qty
       : "按当前持仓38%加仓"+qty;
     // 执行完止损后立即刷新：不符合加仓条件的持仓马上从列表刷新掉，不留过期行
-    const okMsg = "<b style='color:#22c55e'>["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
+    const okMsg = "["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
       " 加仓成功："+note+" · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
-      "（浮盈"+fmtUsd(pos.unrealized)+"回撤50%即"+fmtUsd(pos.unrealized*0.5)+"触发）</b>";
+      "（浮盈"+fmtUsd(pos.unrealized)+"回撤50%即"+fmtUsd(pos.unrealized*0.5)+"触发）";
     try{ await refresh(); }catch(_){}
-    $status.innerHTML += " · "+okMsg;
+    $status.innerHTML = "["+esc(name)+"] "+sym+" 加仓成功（详见下方执行记录）";
+    addLog(okMsg, "log-ok");                        // 成功记录单独一行
   }catch(e){
     // 已成交但止损未完成（phase=sl）：强制弹窗提示手动设置，关闭弹窗才能继续下一个加仓
     const pend = loadPending().find(x=>x.acctIdx===acctIdx && x.sym===sym && x.dir===dir);
@@ -986,10 +1015,11 @@ async function doAddPos(acctIdx, sym, dir){
     }else{
       clearPending(acctIdx, sym, dir);
     }
-    const errMsg = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message)+"</b>";
+    const errMsg = "["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message);
     // 即使中途失败也立即刷新，避免残留过期的加仓行
     try{ await refresh(); }catch(_){}
-    $status.innerHTML += " · "+errMsg;
+    $status.innerHTML = "["+esc(name)+"] "+sym+" 加仓失败（详见下方执行记录）";
+    addLog(errMsg, "log-err");                      // 错误记录单独一行
     throw e;
   }
 }
@@ -1099,12 +1129,12 @@ async function autoLoop(){
         $status.innerHTML += " · <span style='color:var(--blue2)'>自动加仓 "+esc(sym)+"…</span>";
         await addPos(acctIdx, sym, dir);
       }catch(e){
-        $status.innerHTML += " · <span style='color:#ef4444'>"+esc(sym)+" 跳过："+esc(e.message)+"</span>";
+        addLog("["+esc(sym)+"] 自动加仓跳过："+esc(e.message), "log-warn");
       }
       // 上一条（加仓+设止损）已执行完，等 1 秒再进行下一条
       await new Promise(r=>setTimeout(r,1000));
     }
-    if(autoRunning) $status.innerHTML += " · <span style='color:#22c55e'>本轮完成，10s 后下一轮</span>";
+    if(autoRunning) addLog("本轮完成，10s 后下一轮", "log-warn");
   }catch(e){
     $status.innerHTML = "<span style='color:#f5b759'>⚠ 网络中断或接口异常，等待 10s 后自动重试："+esc(e.message)+"</span>";
   }
@@ -1166,14 +1196,14 @@ async function resumePendingSL(){
     try{
       const sl = await applyStopLoss(acct, name, t.acctIdx, t.sym, t.dir);
       clearPending(t.acctIdx, t.sym, t.dir);
-      $status.innerHTML += " · <b style='color:#22c55e'>["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRules())[t.sym]?.pricePrec||2)+"</b>";
+      addLog("["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRules())[t.sym]?.pricePrec||2), "log-ok");
     }catch(e){
       // 仓位已平/无需止损 → 清除待办，不再补跑
       if(/无需|已平仓|不存在/i.test(e.message)){
         clearPending(t.acctIdx, t.sym, t.dir);
-        $status.innerHTML += " · <b style='color:#888'>["+esc(name)+"] "+t.sym+" "+esc(e.message)+"（已清理待办）</b>";
+        addLog("["+esc(name)+"] "+t.sym+" "+esc(e.message)+"（已清理待办）", "log-warn");
       }else{
-        $status.innerHTML += " · <b style='color:#ef4444'>["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+"（请手动在币安设置止损，待办任务将自动过期）</b>";
+        addLog("["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+"（请手动在币安设置止损，待办任务将自动过期）", "log-err");
       }
       break;   // 一个失败先停下，避免连续全失败
     }
