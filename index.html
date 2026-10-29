@@ -316,11 +316,11 @@ async function fetchJson(url, opts, timeoutMs=15000){
     return await r.json();
   }finally{ clearTimeout(t); }
 }
-async function signedFetch(acct, method, path, query){
+async function signedFetch(acct, method, path, query, timeoutMs=12000){
   const doFetch = async(q) => {
     const sig = await signQuery(q, acct.api_secret);
     return fetchJson(FAPI+path+"?"+q+"&signature="+sig,
-      {method, headers:{"X-MBX-APIKEY":acct.api_key}});
+      {method, headers:{"X-MBX-APIKEY":acct.api_key}}, timeoutMs);
   };
   let data = await doFetch(query);
   if(data && data.code===-1021){
@@ -447,6 +447,21 @@ const SL_KEY="roi_sl_v1";
 function loadSL(){ try{ return JSON.parse(localStorage.getItem(SL_KEY)||"[]"); }catch(e){ return []; } }
 function saveSL(a){ localStorage.setItem(SL_KEY, JSON.stringify(a)); }
 function newClientAlgoId(){ return "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6); }
+
+/* 止损断点续跑：加仓成交后、止损完成前把任务记录到本地。
+   手机端切后台/锁屏/页面被杀导致多轮止损中断时，重开页面会自动补设止损，
+   保证“加完仓设止损”最终一定成功。 */
+const PEND_KEY="roi_sl_pending_v1";
+function loadPending(){ try{ return JSON.parse(localStorage.getItem(PEND_KEY)||"[]"); }catch(e){ return []; } }
+function savePending(list){ try{ localStorage.setItem(PEND_KEY, JSON.stringify(list)); }catch(e){} }
+function upsertPending(t){
+  const list = loadPending().filter(x=>!(x.acctIdx===t.acctIdx && x.sym===t.sym && x.dir===t.dir));
+  list.push(t);
+  savePending(list);
+}
+function clearPending(acctIdx, sym, dir){
+  savePending(loadPending().filter(x=>!(x.acctIdx===acctIdx && x.sym===sym && x.dir===dir)));
+}
 
 async function listOpenAlgo(acct, sym){
   const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder",
@@ -606,6 +621,35 @@ async function setStopLoss(acct, sym, pos, dir){
   throw new Error("设止损失败（未知错误）");
 }
 
+/* ============== 止损保障流程（查持仓 → 撤旧止损 → 挂新止损，多轮重试） ==============
+   加仓主流程与断点续跑共用：速度慢也优先保证“止损必须设置成功” */
+async function applyStopLoss(acct, name, acctIdx, sym, dir){
+  let pos=null;
+  for(let t=0; t<3 && !pos; t++){
+    try{ pos = await getPosition(acct, sym, dir); }catch(e){}
+    if(!pos) await sleep(800);
+  }
+  if(!pos) throw new Error("加仓已成交，但持仓查询多次失败——请立即手动确认仓位并设置止损");
+  let stopPrice=null, lastErr=null;
+  for(let round=0; round<4; round++){
+    $status.innerHTML = "["+esc(name)+"] "+sym+" 撤旧止损/挂新止损 第"+(round+1)+"轮 <span class='loading-dots'></span>";
+    try{
+      pos = await getPosition(acct, sym, dir);
+      if(!pos) throw new Error("持仓查询失败");
+      await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
+      stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试8次）
+      break;
+    }catch(e){
+      lastErr = e;
+      await sleep([1000,1500,2500,4000][round]);
+    }
+  }
+  if(stopPrice===null){
+    throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（"+((lastErr&&lastErr.message)||"未知错误")+"）——请立即手动设置止损！");
+  }
+  return {stopPrice, pos};
+}
+
 /* ============== 刷新 ============== */
 async function refresh(){
   const accounts = loadKeys().filter(a=>a && a.api_key && a.api_secret);
@@ -700,38 +744,24 @@ async function addPos(acctIdx, sym, dir){
 
     // 3. 市价加仓（网络超时也会查持仓确认是否已成交，绝不盲目重下）
     $status.innerHTML = "正在市价加仓 "+sym+" <span class='loading-dots'></span>";
+    // 记录断点：加仓开始（phase=add）；成交后切到 phase=sl，重开页面可续跑补设止损
+    upsertPending({acctIdx, sym, dir, phase:"add", ts:Date.now()});
     const filled = await postOrderAutoRobust(acct, sym, dir, qty, pre.amt);
-    if(!filled.filled) throw new Error("加仓未成交（网络异常且持仓无变化）");
+    if(!filled.filled){
+      clearPending(acctIdx, sym, dir);            // 确认未成交，无仓位变化，无需补止损
+      throw new Error("加仓未成交（网络异常且持仓无变化）");
+    }
+    upsertPending({acctIdx, sym, dir, phase:"sl", ts:Date.now()});
 
     // 4. 【核心保障】撤旧止损 → 挂新止损，多轮循环重试直到服务端确认成功；
-    //    加仓已成交，这一步慢也一定要完成：最多 4 轮，每轮内部再各自重试，
-    //    速度慢优先保证“加完仓设止损成功”
+    //    加仓已成交，这一步慢也一定要完成（最多4轮，内部各自再重试），
+    //    速度慢优先保证“加完仓设止损成功”；若中途页面被杀，重开会自动续跑
     $status.innerHTML = "加仓已成交，正在撤销旧止损并挂新止损 <span class='loading-dots'></span>";
     await sleep(600);
-    let pos=null;
-    for(let t=0; t<3 && !pos; t++){
-      try{ pos = await getPosition(acct, sym, dir); }catch(e){}
-      if(!pos) await sleep(800);
-    }
-    if(!pos) throw new Error("加仓已成交，但持仓查询多次失败——请立即手动确认仓位并设置止损");
-
-    let stopPrice=null, lastErr=null;
-    for(let round=0; round<4; round++){
-      $status.innerHTML = "["+esc(name)+"] "+sym+" 加仓已成交 · 撤旧止损/挂新止损 第"+(round+1)+"轮 <span class='loading-dots'></span>";
-      try{
-        pos = await getPosition(acct, sym, dir);
-        if(!pos) throw new Error("持仓查询失败");
-        await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
-        stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试8次）
-        break;
-      }catch(e){
-        lastErr = e;
-        await sleep([1000,1500,2500,4000][round]);
-      }
-    }
-    if(stopPrice===null){
-      throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（"+((lastErr&&lastErr.message)||"未知错误")+"）——请立即手动设置止损！");
-    }
+    const sl = await applyStopLoss(acct, name, acctIdx, sym, dir);
+    const stopPrice = sl.stopPrice;
+    const pos = sl.pos;
+    clearPending(acctIdx, sym, dir);
 
     const note = useMinFallback
       ? "加仓数量低于系统最小要求，按最小加仓数量"+qty
@@ -743,6 +773,9 @@ async function addPos(acctIdx, sym, dir){
     try{ await refresh(); }catch(_){}
     $status.innerHTML += " · "+okMsg;
   }catch(e){
+    // 已成交但止损未完成（phase=sl）的任务保留在本地，页面重开自动续跑补设止损
+    const pend = loadPending().find(x=>x.acctIdx===acctIdx && x.sym===sym && x.dir===dir);
+    if(!(pend && pend.phase==="sl")) clearPending(acctIdx, sym, dir);
     const errMsg = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message)+"</b>";
     // 即使中途失败也立即刷新，避免残留过期的加仓行
     try{ await refresh(); }catch(_){}
@@ -906,10 +939,44 @@ setInterval(pingNet, 5000);
 window.addEventListener("online", pingNet);
 window.addEventListener("offline", ()=>{ $net.className="net-ping net-fail"; $net.textContent="网络连接失败"; });
 
+/* ============== 断点续跑：重开页面自动补设未完成的止损（手机端防杀） ============== */
+async function resumePendingSL(){
+  const pend = loadPending().filter(x=>x.phase==="sl");
+  if(!pend.length) return;
+  const accounts = loadKeys().filter(a=>a && a.api_key && a.api_secret);
+  for(const t of pend){
+    const acct = accounts[t.acctIdx];
+    if(!acct) continue;
+    const name = acctName(acct, t.acctIdx);
+    $status.innerHTML = "检测到未完成的止损任务 ["+esc(name)+"] "+t.sym+"，正在补设止损 <span class='loading-dots'></span>";
+    try{
+      const sl = await applyStopLoss(acct, name, t.acctIdx, t.sym, t.dir);
+      clearPending(t.acctIdx, t.sym, t.dir);
+      $status.innerHTML += " · <b style='color:#22c55e'>["+esc(name)+"] "+t.sym+" 止损已补设 @"+sl.stopPrice.toFixed((await getRules())[t.sym]?.pricePrec||2)+"</b>";
+    }catch(e){
+      $status.innerHTML += " · <b style='color:#ef4444'>["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+"（任务已保留，下次打开页面会再试）</b>";
+      break;   // 一个失败先停下，避免连续全失败
+    }
+  }
+}
+
 /* ============== 启动 ============== */
 $roiSel.value = String(ROI_MIN);
 $roiSel.addEventListener("change", ()=>{ saveRoiMin(parseFloat($roiSel.value)); refresh(); });
 if(loadKeys().some(k=>k && k.api_key && k.api_secret)) refresh();
+resumePendingSL();
+
+/* 切后台提示：有止损任务未完成时提醒保持前台（手机端后台定时器会被冻结） */
+document.addEventListener("visibilitychange", ()=>{
+  const hasPending = loadPending().some(x=>x.phase==="sl");
+  if(hasPending){
+    document.title = document.hidden
+      ? "⚠ 止损未完成，请保持页面在前台"
+      : "⚠ 有止损待设置 - 币安合约 · 高回报率持仓榜";
+  }else{
+    document.title = "币安合约 · 高回报率持仓榜";
+  }
+});
 </script>
 </body>
 </html>
