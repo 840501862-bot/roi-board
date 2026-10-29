@@ -640,22 +640,24 @@ async function setStopLoss(acct, sym, pos, dir){
     const half = pos.unrealized*0.5/amtAbs;
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
-  // 【直接设止损】最多重试 2 次（网络抖动时一次重试），失败立即抛出弹窗转人工，不傻等多轮：
-  //  普通 STOP_MARKET 单（closePosition=false）→ 不受 -4130 限制
-  //  按持仓模式挂单：双向(对冲)模式不带 reduceOnly（-1106 会拒绝）、positionSide=LONG/SHORT；
-  //                  单向模式带 reduceOnly=true + positionSide=BOTH（防触发时反向开仓）
+  // 【直接设止损·双通道自适应】最多重试 2 次，失败立即抛出弹窗转人工：
+  //  通道1 普通 STOP_MARKET（POST /fapi/v1/order）：大多数品种支持（含双向/单向模式适配）；
+  //  通道2 算法单 closePosition=true（POST /fapi/v1/algoOrder）：币安对部分品种
+  //        （如 CYPHUSDT）已拒绝普通端点挂止损（-4120 “use the Algo Order API”），自动切换；
+  //        算法单遇 -4130（同方向已有 closePosition 单）→ 按本地记录撤旧后再挂
   //  - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
   //  - 限流/繁忙(-1003/-1015/-1004)：等待后重试
   //  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
   //    （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999）
-  //  - -4130：理论上不再出现；万一出现说明仍有 closePosition 残留 → 明确提示用户手动处理
   const BACKOFF = [600,1200];
   let lastErr = null;
-  let placedOrderId = null;
+  let placedOrderId = null, placedAlgoId = null;
   for(let attempt=0; attempt<2; attempt++){
     const clientOrderId = "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
     const triggerPrice = stopPrice.toFixed(prec);
     let outcome = "error";                             // "placed" | "error"
+    let needAlgo = false;
+    // —— 通道1：普通 STOP_MARKET ——
     for(const ps of (isDual ? (dir==="long" ? ["LONG"] : ["SHORT"]) : ["BOTH"])){
       let data=null, netErr=null;
       try{
@@ -683,6 +685,7 @@ async function setStopLoss(acct, sym, pos, dir){
         }
         if(data.code===-4061){ continue; }               // 换 positionSide
         if(data.code===-1021){ await ensureOffset(true); break; }
+        if(data.code===-4120){ needAlgo = true; break; } // 该品种普通端点不支持挂止损 → 切算法单通道
         if(data.code===-2021 || data.code===-4004){      // 触发价太近 → 推远 0.5%（不许越过入场价）
           const buf = pos.mark*0.005;
           if(pos.amt>0){
@@ -694,21 +697,76 @@ async function setStopLoss(acct, sym, pos, dir){
           }
           break;
         }
-        if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
-          // 服务端仍有 closePosition 残留（旧版算法单，币安不支持列表查询自动撤销）
-          // → 立即明确报错，请用户手动处理一次
-          throw new Error("检测到同方向仍有旧版止损单残留（币安不允许通过API自动撤销）——请打开币安App→合约→策略委托，手动删除该止损单后，重新加仓即可");
-        }
         break;                                           // 其他错误（限流/繁忙等）→ 退避重试
       }
       if(data && data.orderId){ placedOrderId = data.orderId; outcome = "placed"; break; }
       outcome = "placed";                                // 服务端已返回成功
       break;
     }
+    // —— 通道2：普通端点拒绝（-4120）→ 算法单 closePosition=true ——
+    if(outcome==="error" && needAlgo){
+      for(let a=0; a<2; a++){
+        let d=null, nErr=null;
+        try{
+          const q = "symbol="+sym+"&side="+side+"&type=STOP_MARKET&stopPrice="+triggerPrice+
+            "&positionSide="+(isDual ? (dir==="long"?"LONG":"SHORT") : "BOTH")+
+            "&closePosition=true&timeInForce=GTE_GTC&newClientAlgoId="+clientOrderId+
+            "&timestamp="+(await nowMs())+"&recvWindow=10000";
+          d = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
+        }catch(e){ nErr=e; }
+        if(nErr){
+          lastErr = nErr;
+          await sleep(600);
+          try{
+            const placed = await queryAlgo(acct, sym, clientOrderId);
+            if(placed){ placedAlgoId = clientOrderId; outcome = "placed"; }  // 超时但其实已挂上
+          }catch(e){}
+          break;
+        }
+        if(d && d.code!==undefined){
+          lastErr = d;
+          if(d.code===-4130 || /close.?position/i.test(d.msg||"")){
+            // 同方向已有 closePosition 条件单：按本地记录撤旧（本站挂的算法单都存了
+            // clientAlgoId，可自动撤销）；撤不掉且本地无记录 → 明确提示手动处理
+            const cancelled = await cancelPosSL(acct, sym, dir);
+            if(cancelled===0){
+              const before = loadSL().filter(x=>x.symbol===sym && x.dir===dir);
+              if(before.length===0){
+                throw new Error("检测到同方向已有旧版止损单残留且本站无记录（币安不允许通过API自动撤销）——请打开币安App→合约→策略委托手动删除该止损单后重新加仓");
+              }
+            }
+            await sleep(500);
+            continue;
+          }
+          if(d.code===-4061){ continue; }
+          if(d.code===-1021){ await ensureOffset(true); break; }
+          if(d.code===-2021 || d.code===-4004){
+            const buf = pos.mark*0.005;
+            if(pos.amt>0){
+              const floor = pos.entry>0 ? pos.entry*1.001 : -Infinity;
+              stopPrice = Math.max(pos.mark-buf, floor);
+            }else{
+              const ceil = pos.entry>0 ? pos.entry*0.999 : Infinity;
+              stopPrice = Math.min(pos.mark+buf, ceil);
+            }
+            break;
+          }
+          break;
+        }
+        if(d && (d.clientAlgoId || d.algoId)){ placedAlgoId = d.clientAlgoId || String(d.algoId); outcome = "placed"; break; }
+        outcome = "placed";                              // 服务端已返回成功
+        break;
+      }
+    }
     if(outcome === "placed"){
       const all = loadSL();
-      all.push({symbol:sym, dir, orderId:placedOrderId, clientOrderId, triggerPrice:stopPrice,
-        created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      if(placedAlgoId){
+        all.push({symbol:sym, dir, clientAlgoId:placedAlgoId, triggerPrice:stopPrice,
+          created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      }else{
+        all.push({symbol:sym, dir, orderId:placedOrderId, clientOrderId, triggerPrice:stopPrice,
+          created:new Date().toLocaleString("zh-CN",{hour12:false})});
+      }
       saveSL(all);
       return stopPrice;
     }
