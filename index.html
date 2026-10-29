@@ -675,17 +675,22 @@ async function addPos(acctIdx, sym, dir){
     if(!pre) throw new Error("未查到该持仓");
     if(pre.roi < ROI_MIN) throw new Error("投资回报率 "+pre.roi.toFixed(2)+"% < "+ROI_MIN+"%，不满足加仓条件");
 
-    // 2. 计算数量：默认等量（仓位翻倍），不足 minNotional 时兜底
+    // 2. 计算数量：当前持仓数量的 38%；算出数量太小（低于系统最小开仓要求）
+    //    时改用最小加仓数量，保证能正常下单
     const rule = (await getRules())[sym]||{};
-    let qty = Math.abs(pre.amt);
-    let equalAdd = true;
-    if(pre.notional < rule.minNotional){
-      qty = (rule.minNotional+1)/pre.mark;
-      equalAdd = false;
-    }
+    let qty = Math.abs(pre.amt) * 0.38;
+    let useMinFallback = false;
     if(rule.step>0){
       qty = Math.floor(qty/rule.step)*rule.step;
       qty = parseFloat(qty.toFixed(10));
+    }
+    if(qty<=0 || qty*pre.mark < rule.minNotional){
+      qty = (rule.minNotional+1)/pre.mark;
+      if(rule.step>0){
+        qty = Math.floor(qty/rule.step)*rule.step;
+        qty = parseFloat(qty.toFixed(10));
+      }
+      useMinFallback = true;
     }
     if(qty<=0) throw new Error("计算出的加仓数量为 0");
 
@@ -724,9 +729,9 @@ async function addPos(acctIdx, sym, dir){
       throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（"+((lastErr&&lastErr.message)||"未知错误")+"）——请立即手动设置止损！");
     }
 
-    const note = equalAdd
-      ? "等量加仓"+qty+"（仓位翻倍）"
-      : "当前仓位"+pre.notional.toFixed(2)+"不足最小开仓"+rule.minNotional.toFixed(2)+"，按最小+1";
+    const note = useMinFallback
+      ? "加仓数量低于系统最小要求，按最小加仓数量"+qty
+      : "按当前持仓38%加仓"+qty;
     // 执行完止损后立即刷新：不符合加仓条件的持仓马上从列表刷新掉，不留过期行
     const okMsg = "<b style='color:#22c55e'>["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
       " 加仓成功："+note+" · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
