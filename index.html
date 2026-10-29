@@ -224,8 +224,8 @@ const $autoBtn  = document.getElementById("btnAuto");
 const $roiSel   = document.getElementById("roiFilter");
 const $execLog  = document.getElementById("execLog");
 
-/* 执行记录：成功/失败各占一行（最多保留 60 条，超出自动清理最早记录） */
-const LOG_MAX = 60;
+/* 执行记录：成功/失败各占一行（只保留最新 2 行） */
+const LOG_MAX = 2;
 function addLog(html, cls){
   if(!$execLog) return;
   const line = document.createElement("div");
