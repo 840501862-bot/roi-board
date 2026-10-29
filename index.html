@@ -898,7 +898,19 @@ async function refresh(){
 }
 
 /* ============== 加仓主流程 ============== */
+/* 全局加仓串行锁：手动加仓与自动循环严格一条一条执行（上一条加仓+设止损全部完成后，
+   下一条才开始），杜绝并发叠加导致止损互相干扰 */
+let addBusy=false;
 async function addPos(acctIdx, sym, dir){
+  while(addBusy) await sleep(250);        // 等上一条执行完
+  addBusy = true;
+  try{
+    return await doAddPos(acctIdx, sym, dir);
+  }finally{
+    addBusy = false;
+  }
+}
+async function doAddPos(acctIdx, sym, dir){
   const accounts = loadKeys().filter(a=>a && a.api_key && a.api_secret);
   const acct = accounts[acctIdx];
   if(!acct) throw new Error("无账户");
@@ -1089,7 +1101,8 @@ async function autoLoop(){
       }catch(e){
         $status.innerHTML += " · <span style='color:#ef4444'>"+esc(sym)+" 跳过："+esc(e.message)+"</span>";
       }
-      await new Promise(r=>setTimeout(r,1500));
+      // 上一条（加仓+设止损）已执行完，等 1 秒再进行下一条
+      await new Promise(r=>setTimeout(r,1000));
     }
     if(autoRunning) $status.innerHTML += " · <span style='color:#22c55e'>本轮完成，10s 后下一轮</span>";
   }catch(e){
