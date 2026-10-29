@@ -640,7 +640,7 @@ async function setStopLoss(acct, sym, pos, dir){
     const half = pos.unrealized*0.5/amtAbs;
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
-  // 【稳定性保障】挂新止损最多重试 4 次、退避递增（用户要求：失败要快速弹窗，别傻等）：
+  // 【直接设止损】最多重试 2 次（网络抖动时一次重试），失败立即抛出弹窗转人工，不傻等多轮：
   //  普通 STOP_MARKET 单（closePosition=false）→ 不受 -4130 限制
   //  按持仓模式挂单：双向(对冲)模式不带 reduceOnly（-1106 会拒绝）、positionSide=LONG/SHORT；
   //                  单向模式带 reduceOnly=true + positionSide=BOTH（防触发时反向开仓）
@@ -649,10 +649,10 @@ async function setStopLoss(acct, sym, pos, dir){
   //  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
   //    （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999）
   //  - -4130：理论上不再出现；万一出现说明仍有 closePosition 残留 → 明确提示用户手动处理
-  const BACKOFF = [500,800,1200,2000];
+  const BACKOFF = [600,1200];
   let lastErr = null;
   let placedOrderId = null;
-  for(let attempt=0; attempt<4; attempt++){
+  for(let attempt=0; attempt<2; attempt++){
     const clientOrderId = "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
     const triggerPrice = stopPrice.toFixed(prec);
     let outcome = "error";                             // "placed" | "error"
@@ -712,11 +712,11 @@ async function setStopLoss(acct, sym, pos, dir){
       saveSL(all);
       return stopPrice;
     }
-    if(attempt<7) await sleep(BACKOFF[attempt]);
+    if(attempt<1) await sleep(BACKOFF[attempt]);
   }
   if(lastErr){
     if(lastErr && lastErr.code!==undefined) throw new Error("设止损失败 code "+lastErr.code+": "+(lastErr.msg||""));
-    throw new Error("设止损失败："+((lastErr&&lastErr.message)||"网络错误")+"（已重试8次）");
+    throw new Error("设止损失败："+((lastErr&&lastErr.message)||"网络错误")+"（已重试2次）");
   }
   throw new Error("设止损失败（未知错误）");
 }
@@ -733,23 +733,11 @@ async function applyStopLoss(acct, name, acctIdx, sym, dir){
     if(posErr) throw new Error("持仓查询网络失败（"+posErr.message+"）——请手动确认仓位并设置止损");
     throw new Error("该持仓已平仓，无需设置止损");   // 查询成功但无此仓位 → 任务作废
   }
-  let stopPrice=null, lastErr=null;
-  for(let round=0; round<2; round++){
-    $status.innerHTML = "["+esc(name)+"] "+sym+" 撤旧止损/挂新止损 第"+(round+1)+"轮 <span class='loading-dots'></span>";
-    try{
-      pos = await getPosition(acct, sym, dir);
-      if(!pos) throw new Error("持仓查询失败");
-      await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
-      stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试4次）
-      break;
-    }catch(e){
-      lastErr = e;
-      await sleep([1000,2000][round]);
-    }
-  }
-  if(stopPrice===null){
-    throw new Error("加仓已成交；旧止损已撤销，但新止损多次设置失败（"+((lastErr&&lastErr.message)||"未知错误")+"）——请立即手动设置止损！");
-  }
+  // 直接设止损：撤旧止损 → 挂新止损，一次完成，不再多轮循环；
+  // 失败立即抛出 → 上层弹窗转人工处理（关闭弹窗才能继续下一个）
+  $status.innerHTML = "["+esc(name)+"] "+sym+" 正在设置止损 <span class='loading-dots'></span>";
+  await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
+  const stopPrice = await setStopLoss(acct, sym, pos, dir);  // 直接挂新止损
   return {stopPrice, pos};
 }
 
@@ -863,10 +851,9 @@ async function addPos(acctIdx, sym, dir){
     }
     upsertPending({acctIdx, sym, dir, phase:"sl", ts:Date.now()});
 
-    // 4. 【核心保障】撤旧止损 → 挂新止损，多轮循环重试直到服务端确认成功；
-    //    加仓已成交，这一步慢也一定要完成（最多4轮，内部各自再重试），
-    //    速度慢优先保证“加完仓设止损成功”；若中途页面被杀，重开会自动续跑
-    $status.innerHTML = "加仓已成交，正在撤销旧止损并挂新止损 <span class='loading-dots'></span>";
+    // 4. 【核心保障】加仓已成交 → 直接撤旧止损 → 挂新止损（一次性完成）；
+    //    失败立即弹窗转人工处理，关闭弹窗才能继续下一个加仓
+    $status.innerHTML = "加仓已成交，正在设置止损 <span class='loading-dots'></span>";
     await sleep(600);
     const sl = await applyStopLoss(acct, name, acctIdx, sym, dir);
     const stopPrice = sl.stopPrice;
