@@ -308,7 +308,7 @@ function loadKeys(){ try{ return JSON.parse(localStorage.getItem("roi_keys_v1")|
 function saveKeys(k){ localStorage.setItem("roi_keys_v1", JSON.stringify(k)); }
 function acctName(acct, idx){ return acct.name || ("账户"+(idx+1)); }
 
-async function fetchJson(url, opts, timeoutMs=15000){
+async function fetchJson(url, opts, timeoutMs=12000){
   const ctl = new AbortController();
   const t = setTimeout(()=>ctl.abort(), timeoutMs);
   try{
@@ -501,6 +501,16 @@ async function queryOrder(acct, sym, clientOrderId){
     return null;
   }catch(e){ return null; }
 }
+/* 查询持仓模式：true=双向(对冲)，false=单向。双向模式下挂平仓单不允许传 reduceOnly（-1106），
+   positionSide 用 LONG/SHORT；单向模式必须 positionSide=BOTH + reduceOnly=true（防触发时反向开仓）
+   注意：接口返回字段是 dualSidePosition */
+async function apiGetMode(acct){
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/positionSide/dual",
+      "timestamp="+(await nowMs())+"&recvWindow=10000");
+    return !!(d && d.dualSidePosition===true);
+  }catch(e){ return null; }
+}
 async function cancelOneAlgo(acct, sym, algo){
   let idQ = "";
   if(algo && algo.clientAlgoId) idQ = "clientAlgoId="+encodeURIComponent(algo.clientAlgoId);
@@ -574,7 +584,15 @@ async function setStopLoss(acct, sym, pos, dir){
   const rule = (await getRules())[sym]||{};
   const prec = rule.pricePrec||2;
   const side = pos.amt>0 ? "SELL" : "BUY";
-  const cands = dir==="long" ? ["LONG","BOTH"] : ["SHORT","BOTH"];
+  // 持仓模式：双向(对冲)模式挂平仓单不允许传 reduceOnly（-1106）、positionSide 用 LONG/SHORT；
+  // 单向模式必须带 reduceOnly=true + positionSide=BOTH（防触发时反向开仓）
+  let dual = acct._dual;
+  if(dual===undefined){
+    try{ dual = await apiGetMode(acct); }catch(e){ dual=null; }
+    acct._dual = dual;
+  }
+  const isDual = (dual===true);
+  const cands = isDual ? (dir==="long" ? ["LONG"] : ["SHORT"]) : ["BOTH"];
   // 止损价 = 入场均价 + 当前浮盈的 50%（多单示例）：
   //   多单：入场价 + (现价-入场价)×0.5；空单：入场价 - (入场价-现价)×0.5
   // 止损价永远夹在入场均价与现价之间：无论加仓几次、均价如何被抬高，
@@ -587,21 +605,19 @@ async function setStopLoss(acct, sym, pos, dir){
     const half = pos.unrealized*0.5/amtAbs;
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
-  // 【稳定性保障】挂新止损最多重试 8 次、退避递增：
-  //  普通 STOP_MARKET + reduceOnly（closePosition=false）→ 不受 -4130（同方向 closePosition 单）
-  //  限制，即使服务端残留旧版算法单也能挂上，杜绝“已有止损的仓位加仓必失败”死锁
+  // 【稳定性保障】挂新止损最多重试 4 次、退避递增（用户要求：失败要快速弹窗，别傻等）：
+  //  普通 STOP_MARKET 单（closePosition=false）→ 不受 -4130 限制
+  //  按持仓模式挂单：双向(对冲)模式不带 reduceOnly（-1106 会拒绝）、positionSide=LONG/SHORT；
+  //                  单向模式带 reduceOnly=true + positionSide=BOTH（防触发时反向开仓）
   //  - 网络超时/错误：先查服务端该止损是否其实已挂上（有则视为成功），没有才重试
   //  - 限流/繁忙(-1003/-1015/-1004)：等待后重试
   //  - -2021/-4004（触发价距现价过近会立即触发）：把触发价推远 0.5% 重试
-  //    （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999，
-  //      保证任何情况下都不会挂出“触发即亏损”的止损）
-  //  - -4130：理论上不再出现（closePosition=false）；万一出现说明仍有 closePosition 残留且
-  //    无法自动撤销 → 明确提示用户手动处理
-  //  - 其余错误：退避后重试
-  const BACKOFF = [600,1000,1500,2500,3500,5000,5000];
+  //    （推远后的触发价不允许越过入场价：多单不低于入场价×1.001、空单不高于入场价×0.999）
+  //  - -4130：理论上不再出现；万一出现说明仍有 closePosition 残留 → 明确提示用户手动处理
+  const BACKOFF = [500,800,1200,2000];
   let lastErr = null;
   let placedOrderId = null;
-  for(let attempt=0; attempt<8; attempt++){
+  for(let attempt=0; attempt<4; attempt++){
     const clientOrderId = "sl"+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
     const triggerPrice = stopPrice.toFixed(prec);
     let outcome = "error";                             // "placed" | "error"
@@ -610,14 +626,14 @@ async function setStopLoss(acct, sym, pos, dir){
       try{
         const q = "symbol="+sym+"&side="+side +
           "&type=STOP_MARKET&stopPrice="+triggerPrice +
-          "&quantity="+amtAbs+"&reduceOnly=true&positionSide="+ps +
+          "&quantity="+amtAbs+(isDual?"":"&reduceOnly=true")+"&positionSide="+ps +
           "&timeInForce=GTE_GTC&newClientOrderId="+clientOrderId +
           "&timestamp="+(await nowMs())+"&recvWindow=10000";
         data = await signedFetch(acct, "POST", "/fapi/v1/order", q);
       }catch(e){ netErr=e; }
       if(netErr){
         lastErr = netErr;
-        await sleep(800);
+        await sleep(600);
         try{
           const placed = await queryOrder(acct, sym, clientOrderId);
           if(placed){ placedOrderId = placed.orderId; outcome = "placed"; }  // 超时但其实已挂上
@@ -640,15 +656,9 @@ async function setStopLoss(acct, sym, pos, dir){
           break;
         }
         if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
-          // 本地记录撤不掉且服务端仍有 closePosition 残留（旧版算法单，币安不支持列表查询）
-          // → 立即明确报错，避免 8 次空转，请用户手动处理一次
-          const before = loadSL().filter(x => x.symbol===sym && x.dir===dir);
-          const cancelled = await cancelPosSL(acct, sym, dir);
-          if(cancelled===0 && before.length===0){
-            throw new Error("检测到同方向仍有旧版止损单残留（币安不允许通过API自动撤销）——请打开币安App→合约→策略委托，手动删除该止损单后，重新加仓即可");
-          }
-          await sleep(500);
-          break;
+          // 服务端仍有 closePosition 残留（旧版算法单，币安不支持列表查询自动撤销）
+          // → 立即明确报错，请用户手动处理一次
+          throw new Error("检测到同方向仍有旧版止损单残留（币安不允许通过API自动撤销）——请打开币安App→合约→策略委托，手动删除该止损单后，重新加仓即可");
         }
         break;                                           // 其他错误（限流/繁忙等）→ 退避重试
       }
@@ -682,17 +692,17 @@ async function applyStopLoss(acct, name, acctIdx, sym, dir){
   }
   if(!pos) throw new Error("加仓已成交，但持仓查询多次失败——请立即手动确认仓位并设置止损");
   let stopPrice=null, lastErr=null;
-  for(let round=0; round<4; round++){
+  for(let round=0; round<2; round++){
     $status.innerHTML = "["+esc(name)+"] "+sym+" 撤旧止损/挂新止损 第"+(round+1)+"轮 <span class='loading-dots'></span>";
     try{
       pos = await getPosition(acct, sym, dir);
       if(!pos) throw new Error("持仓查询失败");
       await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
-      stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试8次）
+      stopPrice = await setStopLoss(acct, sym, pos, dir);  // 挂新止损（内部再重试4次）
       break;
     }catch(e){
       lastErr = e;
-      await sleep([1000,1500,2500,4000][round]);
+      await sleep([1000,2000][round]);
     }
   }
   if(stopPrice===null){
@@ -713,20 +723,27 @@ async function refresh(){
   try{
     await ensureOffset();
     const rows=[]; const errs=[];
-    for(let ai=0; ai<accounts.length; ai++){
-      const acct = accounts[ai];
-      const name = acctName(acct, ai);
-      let data;
-      try{ data = await apiGetPositions(acct); }
-      catch(e){ errs.push(name+": "+e.message); continue; }
-      if(!Array.isArray(data)){ errs.push(name+": 返回格式异常"); continue; }
-      for(const p of data){
+    // 分批并发拉取账户持仓（每批最多 3 个并行，避免串行拖慢且不触发币安限流）
+    const fetched = [];
+    for(let i=0; i<accounts.length; i+=3){
+      const batch = accounts.slice(i, i+3).map(async (acct, bi)=>{
+        const ai = i + bi;
+        const name = acctName(acct, ai);
+        try{ return {ai, name, acct, data: await apiGetPositions(acct)}; }
+        catch(e){ return {ai, name, acct, err: e.message}; }
+      });
+      fetched.push(...(await Promise.all(batch)));
+    }
+    for(const r of fetched){
+      if(r.err){ errs.push(r.name+": "+r.err); continue; }
+      if(!Array.isArray(r.data)){ errs.push(r.name+": 返回格式异常"); continue; }
+      for(const p of r.data){
         const amt = parseFloat(p.positionAmt)||0;
         if(amt===0) continue;
         const info = positionInfo(p);
-        const roi = scaleRoi(acct, info.roi);
+        const roi = scaleRoi(r.acct, info.roi);
         if(roi < ROI_MIN) continue;
-        rows.push({acctIdx:ai, acctName:name, is5x:!!acct.is5x, symbol:p.symbol,
+        rows.push({acctIdx:r.ai, acctName:r.name, is5x:!!r.acct.is5x, symbol:p.symbol,
                    amt:info.amt, roi:roi, notional:info.notional});
       }
     }
@@ -824,9 +841,17 @@ async function addPos(acctIdx, sym, dir){
     try{ await refresh(); }catch(_){}
     $status.innerHTML += " · "+okMsg;
   }catch(e){
-    // 已成交但止损未完成（phase=sl）的任务保留在本地，页面重开自动续跑补设止损
+    // 已成交但止损未完成（phase=sl）：强制弹窗提示手动设置，关闭弹窗才能继续下一个加仓
     const pend = loadPending().find(x=>x.acctIdx===acctIdx && x.sym===sym && x.dir===dir);
-    if(!(pend && pend.phase==="sl")) clearPending(acctIdx, sym, dir);
+    if(pend && pend.phase==="sl"){
+      clearPending(acctIdx, sym, dir);   // 已转人工处理，不再自动续跑
+      try{
+        window.alert("【止损设置失败，必须手动处理】\n\n["+name+"] "+sym+" 加仓已成交，但自动设置止损失败：\n"+
+          e.message+"\n\n请立即打开币安App，手动为 "+sym+" 设置止损！\n（点击确定后继续下一个）");
+      }catch(_){}
+    }else{
+      clearPending(acctIdx, sym, dir);
+    }
     const errMsg = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message)+"</b>";
     // 即使中途失败也立即刷新，避免残留过期的加仓行
     try{ await refresh(); }catch(_){}
