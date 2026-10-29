@@ -372,6 +372,7 @@ async function getRules(){
     map[s.symbol] = {
       minNotional: parseFloat((f.MIN_NOTIONAL||{}).notional)||0,
       step,
+      minQty: parseFloat((lot||{}).minQty)||0,
       pricePrec: parseInt(s.pricePrecision,10)||2
     };
   }
@@ -684,10 +685,13 @@ async function addPos(acctIdx, sym, dir){
       qty = Math.floor(qty/rule.step)*rule.step;
       qty = parseFloat(qty.toFixed(10));
     }
-    if(qty<=0 || qty*pre.mark < rule.minNotional){
+    if(qty<=0 || qty*pre.mark < rule.minNotional || (rule.minQty>0 && qty < rule.minQty)){
+      // 数量不足时改用最小加仓数量：先按最少开仓金额折算，再向上取整到最小步长/最小数量，
+      // 保证不低于交易所要求（向下取整会把低单价币种算出 0 而无法下单）
       qty = (rule.minNotional+1)/pre.mark;
+      if(rule.minQty>0 && qty < rule.minQty) qty = rule.minQty;
       if(rule.step>0){
-        qty = Math.floor(qty/rule.step)*rule.step;
+        qty = Math.ceil(qty/rule.step)*rule.step;
         qty = parseFloat(qty.toFixed(10));
       }
       useMinFallback = true;
