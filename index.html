@@ -708,9 +708,11 @@ async function setStopLoss(acct, sym, pos, dir){
       for(let a=0; a<2; a++){
         let d=null, nErr=null;
         try{
-          const q = "symbol="+sym+"&side="+side+"&type=STOP_MARKET&stopPrice="+triggerPrice+
+          // 算法单参数（币安 Algo Service）：algoType=CONDITIONAL 必填（缺失报 -1102），
+          // 触发价字段是 triggerPrice（不是 stopPrice），closePosition=true 自带只平仓属性
+          const q = "symbol="+sym+"&side="+side+"&algoType=CONDITIONAL&type=STOP_MARKET&triggerPrice="+triggerPrice+
             "&positionSide="+(isDual ? (dir==="long"?"LONG":"SHORT") : "BOTH")+
-            "&closePosition=true&timeInForce=GTE_GTC&newClientAlgoId="+clientOrderId+
+            "&closePosition=true&timeInForce=GTC&newClientAlgoId="+clientOrderId+
             "&timestamp="+(await nowMs())+"&recvWindow=10000";
           d = await signedFetch(acct, "POST", "/fapi/v1/algoOrder", q);
         }catch(e){ nErr=e; }
