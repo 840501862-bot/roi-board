@@ -463,10 +463,17 @@ function clearPending(acctIdx, sym, dir){
   savePending(loadPending().filter(x=>!(x.acctIdx===acctIdx && x.sym===sym && x.dir===dir)));
 }
 
-async function listOpenAlgo(acct, sym){
-  const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder",
-    "symbol="+sym+"&timestamp="+(await nowMs())+"&recvWindow=10000");
-  return Array.isArray(d) ? d : [];
+/* 查询单条条件单：币安 /fapi/v1/algoOrder 必须带 algoId/clientAlgoId（不带则返回 -1102），
+   不支持“列出全部”，故只能按本站挂单时保存的 clientAlgoId 逐个查询/确认 */
+async function queryAlgo(acct, sym, clientAlgoId){
+  if(!clientAlgoId) return null;
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/algoOrder",
+      "symbol="+sym+"&clientAlgoId="+encodeURIComponent(clientAlgoId)+
+      "&timestamp="+(await nowMs())+"&recvWindow=10000");
+    if(d && d.code===undefined && d.clientAlgoId) return d;
+    return null;
+  }catch(e){ return null; }
 }
 async function cancelOneAlgo(acct, sym, algo){
   let idQ = "";
@@ -477,50 +484,28 @@ async function cancelOneAlgo(acct, sym, algo){
   const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
   return !(d && d.code!==undefined);
 }
+/* 撤旧止损：币安算法单接口不支持“列出全部”（不带 ID 返回 -1102），
+   因此基于本站挂单时同步保存的本地记录（roi_sl_v1，含 clientAlgoId）逐条撤销。
+   每条最多重试 3 次并确认撤销成功；只有确认撤掉的记录才从本地移除，
+   失败的记录原样保留（下次加仓/续跑会再撤）——记录与服务端始终一致，绝不误清。
+   若本地本就没有该方向记录（止损由币安App手动挂/记录丢失），返回 0，交由上层提示用户手动处理 */
 async function cancelPosSL(acct, sym, dir){
   const all = loadSL();
-  const wantSide = dir==="long" ? "SELL" : "BUY";
-  const removed = [];
-  let n=0;
-  const matches = o => {
-    const type = String(o.type||"");
-    if(type!=="STOP_MARKET" && type!=="TRAILING_STOP_MARKET") return false;
-    if(String(o.side)!==wantSide) return false;
-    const isClose = String(o.closePosition)==="true" ||
-                    (o.closePosition===undefined && String(o.reduceOnly)==="true");
-    return isClose;
-  };
-  // 服务端扫描撤销，撤到确认同方向止损清空为止（最多4轮）；
-  // 列表查询失败（网络抖动）会重试，确保旧止损真正被撤掉，
-  // 新止损才不会被币安「同方向只允许一个 closePosition 条件单」(-4130) 拒绝
-  for(let round=0; round<4; round++){
-    let open=[];
-    let listOk=false;
-    for(let listTry=0; listTry<3; listTry++){
-      try{ open = await listOpenAlgo(acct, sym); listOk=true; break; }catch(e){
-        await sleep(700*(listTry+1));
-      }
+  const targets = all.filter(x => x.symbol===sym && x.dir===dir);
+  if(!targets.length) return 0;
+  let n=0; const okIds=[];
+  for(const it of targets){
+    if(!it.clientAlgoId) continue;
+    let done=false;
+    for(let t=0; t<3 && !done; t++){
+      try{ done = await cancelOneAlgo(acct, sym, it); }catch(e){ done=false; }
+      if(!done) await sleep(600*(t+1));
     }
-    if(!listOk){ await sleep(800); continue; }
-    const targets = open.filter(matches);
-    if(!targets.length) break;                       // 已清空
-    let roundHit=false;
-    for(const o of targets){
-      if(await cancelOneAlgo(acct, sym, o)){
-        n++; roundHit=true;
-        if(o.clientAlgoId) removed.push(o.clientAlgoId);
-      }
-    }
-    if(!roundHit) await sleep(600);
-    await sleep(400);
+    if(done){ n++; okIds.push(it.clientAlgoId); }
   }
-  // 本地记录兜底（服务端扫描失败或订单未在列表中时）
-  for(const it of all){
-    if(!(it.symbol===sym && it.dir===dir)) continue;
-    if(removed.indexOf(it.clientAlgoId)>=0) continue;
-    try{ if(await cancelOneAlgo(acct, sym, it)) n++; }catch(e){}
+  if(okIds.length){
+    saveSL(all.filter(x => !(x.symbol===sym && x.dir===dir && okIds.indexOf(x.clientAlgoId)>=0)));
   }
-  if(all.length) saveSL(all.filter(x => !(x.symbol===sym && x.dir===dir)));
   return n;
 }
 
@@ -571,11 +556,8 @@ async function setStopLoss(acct, sym, pos, dir){
         lastErr = netErr;
         await sleep(800);
         try{
-          const open = await listOpenAlgo(acct, sym);
-          if(open.find(o => String(o.clientAlgoId)===clientAlgoId ||
-             (String(o.type)==="STOP_MARKET" && String(o.side)===side && String(o.closePosition)==="true"))){
-            outcome = "placed";                          // 超时但其实已挂上
-          }
+          const placed = await queryAlgo(acct, sym, clientAlgoId);
+          if(placed){ outcome = "placed"; }      // 超时但其实已挂上
         }catch(e){}
         break;                                           // 网络错误 → 退避后整轮重试
       }
@@ -595,8 +577,14 @@ async function setStopLoss(acct, sym, pos, dir){
           break;
         }
         if(data.code===-4130 || /close.?position/i.test(data.msg||"")){
-          // 旧止损没撤干净 → 强制撤干净并校验，再原地重试
-          try{ await cancelPosSL(acct, sym, dir); }catch(e){}
+          // 旧止损没撤干净 → 按本地记录强制撤并校验，再原地重试
+          const before = loadSL().filter(x => x.symbol===sym && x.dir===dir);
+          const cancelled = await cancelPosSL(acct, sym, dir);
+          if(cancelled===0 && before.length===0){
+            // 本地本就没有该方向止损记录：止损可能是币安App手动挂的或本地记录丢失，
+            // 无法自动撤销 → 立即明确报错，避免 8 次空转，请用户手动处理
+            throw new Error("检测到同方向已存在止损单但本站无对应记录（可能由币安App手动设置或本地记录丢失）——请先在币安合约手动取消该止损，再重新加仓/补设");
+          }
           await sleep(500);
           break;
         }
