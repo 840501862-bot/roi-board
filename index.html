@@ -727,12 +727,17 @@ async function addPos(acctIdx, sym, dir){
     const note = equalAdd
       ? "等量加仓"+qty+"（仓位翻倍）"
       : "当前仓位"+pre.notional.toFixed(2)+"不足最小开仓"+rule.minNotional.toFixed(2)+"，按最小+1";
-    $status.innerHTML = "<b style='color:#22c55e'>["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
-      " 加仓成功："+note+" · 已撤旧止损"+canceled+"单 · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
+    // 执行完止损后立即刷新：不符合加仓条件的持仓马上从列表刷新掉，不留过期行
+    const okMsg = "<b style='color:#22c55e'>["+esc(name)+"] "+sym+" "+(dir==="long"?"多":"空")+
+      " 加仓成功："+note+" · 新止损"+stopPrice.toFixed(rule.pricePrec||2)+
       "（浮盈"+fmtUsd(pos.unrealized)+"回撤50%即"+fmtUsd(pos.unrealized*0.5)+"触发）</b>";
-    setTimeout(refresh, 800);
+    try{ await refresh(); }catch(_){}
+    $status.innerHTML += " · "+okMsg;
   }catch(e){
-    $status.innerHTML = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+e.message+"</b>";
+    const errMsg = "<b style='color:#ef4444'>["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message)+"</b>";
+    // 即使中途失败也立即刷新，避免残留过期的加仓行
+    try{ await refresh(); }catch(_){}
+    $status.innerHTML += " · "+errMsg;
     throw e;
   }
 }
