@@ -551,10 +551,21 @@ async function cancelOneAlgo(acct, sym, algo){
   const d = await signedFetch(acct, "DELETE", "/fapi/v1/algoOrder", q);
   return !(d && d.code!==undefined);
 }
-/* 撤旧止损（普通单 + 旧版算法单兼容）：
-   1) 列出 openOrders 该 symbol 的普通单，撤掉同方向（side + positionSide 匹配）的
-      STOP_MARKET + reduceOnly 单——包括 App 手动挂的普通止损，保证“只留最新一个止损”
-   2) 按本地记录的 clientAlgoId 撤旧版算法单（兼容历史记录）
+/* 列出全部活动算法单（条件单）——币安 Algo Service 的 openAlgoOrders 接口，
+   返回数组含 algoId/clientAlgoId/algoType/orderType/symbol/side/positionSide，
+   能扫到 App 手动挂的、本站挂的、历史残留的（本地无记录也能自动撤销） */
+async function openAlgoOrdersOf(acct){
+  try{
+    const d = await signedFetch(acct, "GET", "/fapi/v1/openAlgoOrders",
+      "timestamp="+(await nowMs())+"&recvWindow=10000");
+    return Array.isArray(d) ? d : [];
+  }catch(e){ return []; }
+}
+/* 撤旧止损（普通单 + 服务端条件单 + 本地旧记录，三路全扫）：
+   1) openOrders 撤普通 STOP_MARKET 单（含 App 手动挂的普通止损）
+   2) openAlgoOrders 撤服务端活动条件单（CONDITIONAL，含 App 手动挂的与历史残留的——
+      不需要本地记录，彻底解决“服务端有止损但本地无记录撤不掉”的死锁）
+   3) 本地记录的旧版算法单（兼容历史，clientAlgoId 逐条撤）
    每条最多重试 3 次并确认撤销成功；只有确认撤掉的记录才从本地移除，
    失败的记录原样保留（下次加仓/续跑会再撤）——记录与服务端始终一致，绝不误清 */
 async function cancelPosSL(acct, sym, dir){
@@ -579,10 +590,32 @@ async function cancelPosSL(acct, sym, dir){
     }
     if(done){ n++; okIds.push("o:"+o.orderId); }
   }
-  // 2) 撤旧版算法单（本地记录含 clientAlgoId）
+  // 2) 撤服务端活动条件单（openAlgoOrders 全量扫描，无需本地记录；
+  //    只撤 STOP_MARKET 止损单，不动 App 手动挂的止盈单）
+  let algos=[], algoOk=false;
+  try{ algos = await openAlgoOrdersOf(acct); algoOk=true; }catch(e){}
+  const algoTargets = (Array.isArray(algos)?algos:[]).filter(o =>
+    o.symbol===sym &&
+    String(o.orderType||o.type)==="STOP_MARKET" &&
+    String(o.side)===wantSide &&
+    (wantPS.indexOf(String(o.positionSide))>=0));
+  for(const o of algoTargets){
+    if(!(o.clientAlgoId || o.algoId!=null)) continue;
+    let done=false;
+    for(let t=0; t<3 && !done; t++){
+      try{ done = await cancelOneAlgo(acct, sym, {clientAlgoId:o.clientAlgoId, algoId:o.algoId}); }catch(e){ done=false; }
+      if(!done) await sleep(500*(t+1));
+    }
+    if(done){
+      n++;
+      okIds.push("a:"+(o.clientAlgoId || String(o.algoId)));
+    }
+  }
+  // 3) 撤旧版算法单（本地记录含 clientAlgoId，兼容历史）
   for(const it of all){
     if(!(it.symbol===sym && it.dir===dir)) continue;
     if(!it.clientAlgoId) continue;
+    if(okIds.indexOf("a:"+it.clientAlgoId)>=0) continue;   // 步骤2 已撤掉
     let done=false;
     for(let t=0; t<3 && !done; t++){
       try{ done = await cancelOneAlgo(acct, sym, it); }catch(e){ done=false; }
