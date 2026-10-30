@@ -1134,7 +1134,6 @@ async function autoLoop(){
       // 上一条（加仓+设止损）已执行完，等 1 秒再进行下一条
       await new Promise(r=>setTimeout(r,1000));
     }
-    if(autoRunning) addLog("本轮完成，10s 后下一轮", "log-warn");
   }catch(e){
     $status.innerHTML = "<span style='color:#f5b759'>⚠ 网络中断或接口异常，等待 10s 后自动重试："+esc(e.message)+"</span>";
   }
