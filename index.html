@@ -701,7 +701,7 @@ async function setStopLoss(acct, sym, pos, dir){
     const half = pos.unrealized*0.5/amtAbs;
     stopPrice = pos.amt>0 ? pos.mark-half : pos.mark+half;
   }
-  // 【直接设止损·双通道自适应】最多重试 2 次，失败立即抛出弹窗转人工：
+  // 【直接设止损·双通道自适应】最多重试 2 次，失败立即抛出（上层改为市价平仓兜底，不再弹窗）：
   //  通道1 普通 STOP_MARKET（POST /fapi/v1/order）：大多数品种支持（含双向/单向模式适配）；
   //  通道2 算法单 closePosition=true（POST /fapi/v1/algoOrder）：币安对部分品种
   //        （如 CYPHUSDT）已拒绝普通端点挂止损（-4120 “use the Algo Order API”），自动切换；
@@ -855,11 +855,98 @@ async function applyStopLoss(acct, name, acctIdx, sym, dir){
     throw new Error("该持仓已平仓，无需设置止损");   // 查询成功但无此仓位 → 任务作废
   }
   // 直接设止损：撤旧止损 → 挂新止损，一次完成，不再多轮循环；
-  // 失败立即抛出 → 上层弹窗转人工处理（关闭弹窗才能继续下一个）
+  // 失败立即抛出 → 上层不弹窗，直接以市价平掉该仓位（绝不留裸仓），平完继续下一个
   $status.innerHTML = "["+esc(name)+"] "+sym+" 正在设置止损 <span class='loading-dots'></span>";
   await cancelPosSL(acct, sym, dir);            // 撤旧止损（内部校验，撤干净为止）
   const stopPrice = await setStopLoss(acct, sym, pos, dir);  // 直接挂新止损
   return {stopPrice, pos};
+}
+
+/* ============== 市价平仓（设置止损失败时的兜底动作） ==============
+   止损失败绝不能留裸仓：直接以市价把当前仓位平掉，平完再清理残留止损单/本地记录。
+   - 数量 = 当前持仓绝对值向下取整到交易所步长（不取整会报 -1111 精度错误）
+   - 双向(对冲)模式：positionSide=LONG/SHORT 且不传 reduceOnly（传了报 -1106）
+   - 单向模式：positionSide=BOTH + reduceOnly=true（数量算错时不会反向开仓）
+   - 每次下单后都回查持仓确认，只有仓位真的清掉才算成功；超时/限流退避重试
+   返回 {closed:true} 或 {closed:false, reason} */
+async function closePositionMarket(acct, sym, dir){
+  let lastErr = null;
+  let dualHint = null;                                  // 模式猜测：遇到 -1106/-4061 时自动纠正
+  for(let attempt=0; attempt<4; attempt++){
+    let pos=null;
+    try{ pos = await getPosition(acct, sym, dir); }
+    catch(e){ lastErr=e; await sleep(800); continue; }
+    if(!pos) return await finishClosed(acct, sym, dir);         // 已无仓位
+    const rule = (await getRules())[sym]||{};
+    let qty = Math.abs(pos.amt);
+    if(rule.step>0){
+      qty = Math.floor(qty/rule.step)*rule.step;
+      qty = parseFloat(qty.toFixed(10));
+    }
+    if(!(qty>0)) return await finishClosed(acct, sym, dir);     // 只剩不足一个步长的碎仓，无法再下市价单
+    const beforeAmt = Math.abs(pos.amt);
+    const side = pos.amt>0 ? "SELL" : "BUY";
+    const isDual = (dualHint!==null) ? dualHint : ((await apiGetMode(acct))===true);
+    const ps = isDual ? (dir==="long"?"LONG":"SHORT") : "BOTH";
+    const q = "symbol="+sym+"&side="+side+"&type=MARKET&quantity="+qty+
+      (isDual?"":"&reduceOnly=true")+"&positionSide="+ps+
+      "&newOrderRespType=ACK&timestamp="+(await nowMs())+"&recvWindow=10000";
+    let data=null, netErr=null;
+    try{ data = await signedFetch(acct, "POST", "/fapi/v1/order", q); }catch(e){ netErr=e; }
+    if(netErr){
+      lastErr = netErr;                                 // 超时：可能已成交 → 回查持仓后再决定
+      await sleep(1200);
+      continue;
+    }
+    if(data && data.code!==undefined){
+      lastErr = data;
+      if(data.code===-1003 || data.code===-1015 || data.code===-1004){   // 限流/服务繁忙
+        await sleep(1500*(attempt+1)); continue;
+      }
+      if(data.code===-1021){ await ensureOffset(true); await sleep(500); continue; }
+      // 模式/仓位侧不匹配、已无仓可平、精度问题 → 纠正猜测后回查持仓重算
+      if(data.code===-1106){ dualHint = true;  await sleep(600); continue; }  // 传了 reduceOnly 被拒 → 实际是双向
+      if(data.code===-4061){ dualHint = false; await sleep(600); continue; }  // positionSide 不匹配 → 实际是单向
+      if(data.code===-1111 || data.code===-2021 || data.code===-4004 || data.code===-2022){
+        await sleep(600); continue;
+      }
+      await sleep(600); continue;
+    }
+    // 下单已被受理（无错误码）：只等成交回报，不再重复下同方向市价单
+    // （双向模式下重复下单会反手开出一个新仓，风险极大）
+    for(let k=0; k<6; k++){
+      await sleep(500);
+      let now=null, chkErr=null;
+      try{ now = await getPosition(acct, sym, dir); }catch(e){ chkErr=e; }
+      if(!now) return await finishClosed(acct, sym, dir);
+      if(!chkErr && Math.abs(now.amt) < beforeAmt) break;   // 已成交一部分 → 回去平掉剩余
+    }
+    let leftNow=null;
+    try{ leftNow = await getPosition(acct, sym, dir); }catch(e){}
+    if(leftNow && Math.abs(leftNow.amt) >= beforeAmt){
+      return {closed:false, reason:"市价平仓单已提交但持仓 3 秒内无变化，请立即在币安确认"};
+    }
+  }
+  // 4 轮都没成功下单：最终确认仓位状态
+  let left=null, checkErr=null;
+  try{ left = await getPosition(acct, sym, dir); }catch(e){ checkErr=e; }
+  if(left){
+    const rule = (await getRules())[sym]||{};
+    const step = rule.step||0;
+    if(!(step>0 && Math.abs(left.amt) < step)){         // 只剩碎仓则按已平处理
+      const why = checkErr ? ("回查持仓失败："+checkErr.message)
+                           : ("平仓后仍有持仓 "+Math.abs(left.amt)+"（"+
+                             ((lastErr&&(lastErr.msg||lastErr.message))||"下单未成功")+"）");
+      return {closed:false, reason:why};
+    }
+  }
+  return await finishClosed(acct, sym, dir);
+}
+/* 平仓完成后的收尾：清掉残留止损单与本地记录，避免干扰下一次加仓 */
+async function finishClosed(acct, sym, dir){
+  try{ await cancelPosSL(acct, sym, dir); }catch(e){}
+  try{ saveSL(loadSL().filter(x=>!(x.symbol===sym && x.dir===dir))); }catch(e){}
+  return {closed:true};
 }
 
 /* ============== 刷新 ============== */
@@ -985,7 +1072,7 @@ async function doAddPos(acctIdx, sym, dir){
     upsertPending({acctIdx, sym, dir, phase:"sl", ts:Date.now()});
 
     // 4. 【核心保障】加仓已成交 → 直接撤旧止损 → 挂新止损（一次性完成）；
-    //    失败立即弹窗转人工处理，关闭弹窗才能继续下一个加仓
+    //    失败则市价平掉该仓位后继续下一条，不再弹窗转人工
     $status.innerHTML = "加仓已成交，正在设置止损 <span class='loading-dots'></span>";
     await sleep(600);
     const sl = await applyStopLoss(acct, name, acctIdx, sym, dir);
@@ -1004,17 +1091,30 @@ async function doAddPos(acctIdx, sym, dir){
     $status.innerHTML = "["+esc(name)+"] "+sym+" 加仓成功（详见下方执行记录）";
     addLog(okMsg, "log-ok");                        // 成功记录单独一行
   }catch(e){
-    // 已成交但止损未完成（phase=sl）：强制弹窗提示手动设置，关闭弹窗才能继续下一个加仓
+    // 已成交但止损未完成（phase=sl）：不弹窗，直接以市价平掉当前仓位（绝不留裸仓），
+    // 平完返回 → 自动执行器继续下一条
     const pend = loadPending().find(x=>x.acctIdx===acctIdx && x.sym===sym && x.dir===dir);
     if(pend && pend.phase==="sl"){
-      clearPending(acctIdx, sym, dir);   // 已转人工处理，不再自动续跑
-      try{
-        window.alert("【止损设置失败，必须手动处理】\n\n["+name+"] "+sym+" 加仓已成交，但自动设置止损失败：\n"+
-          e.message+"\n\n请立即打开币安App，手动为 "+sym+" 设置止损！\n（点击确定后继续下一个）");
-      }catch(_){}
-    }else{
-      clearPending(acctIdx, sym, dir);
+      addLog("["+esc(name)+"] "+sym+" 设止损失败："+esc(e.message)+" → 改以市价平仓", "log-warn");
+      $status.innerHTML = "["+esc(name)+"] "+sym+" 设止损失败，正在市价平仓 <span class='loading-dots'></span>";
+      let closed = {closed:false, reason:"平仓未执行"};
+      try{ closed = await closePositionMarket(acct, sym, dir); }
+      catch(ce){ closed = {closed:false, reason:ce.message}; }
+      if(closed.closed){
+        clearPending(acctIdx, sym, dir);           // 仓位已平，无需再补设止损
+        addLog("["+esc(name)+"] "+sym+" 止损失败已市价平仓", "log-ok");
+      }else{
+        // 平仓也失败：保留待办（重开页面会再补设止损），并明确告警
+        upsertPending({acctIdx, sym, dir, phase:"sl", ts:Date.now()});
+        addLog("["+esc(name)+"] "+sym+" 止损失败且市价平仓失败："+esc(closed.reason||"")+"（请立即在币安手动平仓）", "log-err");
+      }
+      try{ await refresh(); }catch(_){}
+      $status.innerHTML = "["+esc(name)+"] "+sym+
+        (closed.closed ? " 止损失败，已市价平仓" : " 止损失败，市价平仓失败（需手动处理）")+
+        "（详见下方执行记录）";
+      return {slFailed:true, closed:closed.closed};
     }
+    clearPending(acctIdx, sym, dir);
     const errMsg = "["+esc(name)+"] "+sym+" 加仓失败："+esc(e.message);
     // 即使中途失败也立即刷新，避免残留过期的加仓行
     try{ await refresh(); }catch(_){}
@@ -1202,7 +1302,18 @@ async function resumePendingSL(){
         clearPending(t.acctIdx, t.sym, t.dir);
         addLog("["+esc(name)+"] "+t.sym+" "+esc(e.message)+"（已清理待办）", "log-warn");
       }else{
-        addLog("["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+"（请手动在币安设置止损，待办任务将自动过期）", "log-err");
+        // 补设止损失败：不弹窗，直接市价平掉该仓位，避免继续留裸仓
+        addLog("["+esc(name)+"] "+t.sym+" 补设止损失败："+esc(e.message)+" → 改以市价平仓", "log-warn");
+        $status.innerHTML = "["+esc(name)+"] "+t.sym+" 补设止损失败，正在市价平仓 <span class='loading-dots'></span>";
+        let closed = {closed:false, reason:"平仓未执行"};
+        try{ closed = await closePositionMarket(acct, t.sym, t.dir); }
+        catch(ce){ closed = {closed:false, reason:ce.message}; }
+        if(closed.closed){
+          clearPending(t.acctIdx, t.sym, t.dir);
+          addLog("["+esc(name)+"] "+t.sym+" 止损失败已市价平仓", "log-ok");
+        }else{
+          addLog("["+esc(name)+"] "+t.sym+" 止损失败且市价平仓失败："+esc(closed.reason||"")+"（请立即在币安手动平仓）", "log-err");
+        }
       }
       break;   // 一个失败先停下，避免连续全失败
     }
