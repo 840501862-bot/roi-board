@@ -115,6 +115,14 @@
   }
   .key-row input:focus { border-color:var(--blue); }
   .key-row .del { color:var(--red); background:none; border:none; cursor:pointer; font-size:16px; padding:6px; }
+  .key-row .secret-wrap { position:relative; }
+  .key-row .secret-wrap input { padding-right:42px; }
+  .key-row .eye {
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    background:none; border:none; color:var(--sub); cursor:pointer;
+    font-size:11px; padding:4px 5px; line-height:1; border-radius:5px;
+  }
+  .key-row .eye:hover { color:var(--blue); background:rgba(77,142,240,.12); }
   .modal-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; }
   .modal-actions .note { font-size:11px; color:var(--sub); margin-right:auto; padding-top:8px; }
   .err { color:var(--red); font-size:12px; margin-top:8px; min-height:16px; }
@@ -202,7 +210,7 @@
 <div class="overlay" id="overlay">
   <div class="modal">
     <h3>设置 API 密钥</h3>
-    <div class="m-sub">每个账户一行：API Key + Secret。只读持仓权限即可，密钥只存本浏览器 localStorage。</div>
+    <div class="m-sub">每个账户一行：API Key + Secret。只读持仓权限即可，密钥只存本浏览器 localStorage，Secret 默认隐藏（输入框留空表示不修改已保存的 Secret）。</div>
     <div id="keyRows"></div>
     <button class="ghost" id="btnAddKey">+ 添加账户</button>
     <div class="err" id="keyErr"></div>
@@ -343,6 +351,19 @@ async function nowMs(){
 function loadKeys(){ try{ return JSON.parse(localStorage.getItem("roi_keys_v1")||"[]"); }catch(e){ return []; } }
 function saveKeys(k){ localStorage.setItem("roi_keys_v1", JSON.stringify(k)); }
 function acctName(acct, idx){ return acct.name || ("账户"+(idx+1)); }
+/* 每个密钥行的已存 Secret（不写进输入框，避免明文回显；WeakMap 随行元素回收） */
+const keySecrets = new WeakMap();
+function secretHint(s){
+  if(!s) return "API Secret";
+  return "已保存 · 尾号 " + String(s).slice(-4) + " · 留空不修改";
+}
+function secretCell(saved){
+  return '<div class="secret-wrap">'
+    + '<input data-f="api_secret" type="password" autocomplete="new-password" spellcheck="false"'
+    + ' placeholder="' + esc(secretHint(saved)) + '">'
+    + '<button class="eye" type="button" title="显示 / 隐藏 Secret">显示</button>'
+    + '</div>';
+}
 
 async function fetchJson(url, opts, timeoutMs=12000){
   const ctl = new AbortController();
@@ -1206,10 +1227,11 @@ function openKeysModal(){
     row.className = "key-row";
     row.innerHTML =
       '<input data-f="name" placeholder="账户名" value="'+esc(k.name||("账户"+(i+1)))+'">'+
-      '<input data-f="api_key" placeholder="API Key" spellcheck="false" value="'+esc(k.api_key||"")+'">'+
-      '<input data-f="api_secret" placeholder="API Secret" spellcheck="false" value="'+esc(k.api_secret||"")+'">'+
+      '<input data-f="api_key" placeholder="API Key" spellcheck="false" autocomplete="off" value="'+esc(k.api_key||"")+'">'+
+      secretCell(k.api_secret||"")+
       '<label style="font-size:11px;color:var(--sub);text-align:center;cursor:pointer" title="勾选后ROI按7.5%=100%等比缩放"><input type="checkbox" data-f="is5x" '+(k.is5x?'checked':'')+' style="vertical-align:middle;cursor:pointer"> 5倍</label>'+
       '<button class="del" title="删除该账户">✕</button>';
+    keySecrets.set(row, k.api_secret||"");
     rows.appendChild(row);
   });
   document.getElementById("keyErr").textContent = "";
@@ -1225,10 +1247,11 @@ document.getElementById("btnAddKey").addEventListener("click", ()=>{
   row.className = "key-row";
   row.innerHTML =
     '<input data-f="name" placeholder="账户名" value="账户'+(rows.children.length+1)+'">'+
-    '<input data-f="api_key" placeholder="API Key" spellcheck="false">'+
-    '<input data-f="api_secret" placeholder="API Secret" spellcheck="false">'+
+    '<input data-f="api_key" placeholder="API Key" spellcheck="false" autocomplete="off">'+
+    secretCell("")+
     '<label style="font-size:11px;color:var(--sub);text-align:center;cursor:pointer" title="勾选后ROI按7.5%=100%等比缩放"><input type="checkbox" data-f="is5x" style="vertical-align:middle;cursor:pointer"> 5倍</label>'+
     '<button class="del" title="删除该账户">✕</button>';
+  keySecrets.set(row, "");
   rows.appendChild(row);
 });
 document.getElementById("keyRows").addEventListener("click", e=>{
@@ -1237,15 +1260,28 @@ document.getElementById("keyRows").addEventListener("click", e=>{
       document.getElementById("keyErr").textContent = "至少保留 1 个账户"; return;
     }
     e.target.closest(".key-row").remove();
+    return;
+  }
+  if(!e.target.classList.contains("eye")) return;
+  const row = e.target.closest(".key-row");
+  const inp = row.querySelector('[data-f="api_secret"]');
+  if(inp.type === "password"){
+    if(!inp.value) inp.value = keySecrets.get(row) || "";
+    inp.type = "text";
+    e.target.textContent = "隐藏";
+  }else{
+    inp.type = "password";
+    e.target.textContent = "显示";
   }
 });
 document.getElementById("btnSave").addEventListener("click", ()=>{
   const keys=[];
   document.querySelectorAll("#keyRows .key-row").forEach(row=>{
+    const secInput = row.querySelector('[data-f="api_secret"]').value.trim();
     keys.push({
       name: row.querySelector('[data-f="name"]').value.trim() || ("账户"+(keys.length+1)),
       api_key: row.querySelector('[data-f="api_key"]').value.trim(),
-      api_secret: row.querySelector('[data-f="api_secret"]').value.trim(),
+      api_secret: secInput || keySecrets.get(row) || "",
       is5x: row.querySelector('[data-f="is5x"]').checked
     });
   });
