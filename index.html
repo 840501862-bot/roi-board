@@ -355,11 +355,12 @@ function acctName(acct, idx){ return acct.name || ("账户"+(idx+1)); }
 const keySecrets = new WeakMap();
 function secretHint(s){
   if(!s) return "API Secret";
-  return "已保存 · 尾号 " + String(s).slice(-4) + " · 留空不修改";
+  return "已存 · 尾号 " + String(s).slice(-4);
 }
 function secretCell(saved){
   return '<div class="secret-wrap">'
     + '<input data-f="api_secret" type="password" autocomplete="new-password" spellcheck="false"'
+    + ' title="留空表示不修改已保存的 Secret"'
     + ' placeholder="' + esc(secretHint(saved)) + '">'
     + '<button class="eye" type="button" title="显示 / 隐藏 Secret">显示</button>'
     + '</div>';
