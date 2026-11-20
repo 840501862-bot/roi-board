@@ -141,6 +141,8 @@
   }
   .net-ok { color:#22c55e; border-color:#22c55e; }
   .net-ok::before { content:"● "; }
+  .net-warn { color:#f59e0b; border-color:#f59e0b; }
+  .net-warn::before { content:"● "; }
   .net-fail { color:#ef4444; border-color:#ef4444; animation:blink 1s infinite; }
   .net-fail::before { content:"● "; }
   .net-unknown { color:var(--sub); }
@@ -1356,25 +1358,54 @@ $autoBtn.addEventListener("click", ()=>{
 });
 
 /* ============== 网络检测 ============== */
-async function pingNet(){
-  if(navigator.onLine === false){
-    $net.className = "net-ping net-fail"; $net.textContent = "网络连接失败"; return;
-  }
+/* 代理链路偶发 5~7 秒尖峰，所以：12 秒超时 + 失败后重试一次 + 连续两次失败才报红 */
+const PING_TIMEOUT = 12000;
+let netFails = 0, pingBusy = false;
+
+async function pingOnce(){
+  const ctl = new AbortController();
+  const t = setTimeout(()=>ctl.abort(), PING_TIMEOUT);
   try{
-    const ctl = new AbortController();
-    const t = setTimeout(()=>ctl.abort(), 5000);
-    const r = await fetch(FAPI+"/fapi/v1/ping", {method:"GET", signal:ctl.signal});
+    const r = await fetch(FAPI+"/fapi/v1/ping", {method:"GET", signal:ctl.signal, cache:"no-store"});
     clearTimeout(t);
-    if(r.ok){ $net.className = "net-ping net-ok"; $net.textContent = "网络正常"; }
-    else throw new Error("http "+r.status);
+    return r.ok;
   }catch(e){
-    $net.className = "net-ping net-fail"; $net.textContent = "网络连接失败";
+    clearTimeout(t);
+    return false;
+  }
+}
+
+function setNet(state, text){
+  $net.className = "net-ping " + state;
+  $net.textContent = text;
+}
+
+async function pingNet(){
+  if(navigator.onLine === false){ setNet("net-fail", "网络连接失败"); return; }
+  if(pingBusy) return;
+  pingBusy = true;
+  try{
+    let ok = await pingOnce();
+    if(!ok){
+      await new Promise(r=>setTimeout(r, 900));   // 抖动：稍等再试一次
+      ok = await pingOnce();
+    }
+    if(ok){
+      netFails = 0;
+      setNet("net-ok", "网络正常");
+    }else{
+      netFails++;
+      if(netFails < 2){ setNet("net-warn", "网络不稳…"); }
+      else { setNet("net-fail", "网络连接失败"); }
+    }
+  }finally{
+    pingBusy = false;
   }
 }
 pingNet();
 setInterval(pingNet, 10000);          // 10s 一次即可：既保持连接预热，又避免频繁请求干扰下单
 window.addEventListener("online", pingNet);
-window.addEventListener("offline", ()=>{ $net.className="net-ping net-fail"; $net.textContent="网络连接失败"; });
+window.addEventListener("offline", ()=>{ setNet("net-fail", "网络连接失败"); });
 
 /* ============== 断点续跑：重开页面自动补设未完成的止损（手机端防杀） ============== */
 async function resumePendingSL(){
