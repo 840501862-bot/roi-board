@@ -369,12 +369,27 @@ function secretCell(saved){
 }
 
 async function fetchJson(url, opts, timeoutMs=12000){
-  const ctl = new AbortController();
-  const t = setTimeout(()=>ctl.abort(), timeoutMs);
+  const method = String((opts && opts.method) || "GET").toUpperCase();
+  const attempt = async (ms)=>{
+    const ctl = new AbortController();
+    const t = setTimeout(()=>ctl.abort(), ms);
+    try{
+      const r = await fetch(url, Object.assign({}, opts, {signal:ctl.signal}));
+      return await r.json();
+    }finally{ clearTimeout(t); }
+  };
   try{
-    const r = await fetch(url, Object.assign({}, opts, {signal:ctl.signal}));
-    return await r.json();
-  }finally{ clearTimeout(t); }
+    return await attempt(timeoutMs);
+  }catch(e){
+    // 只有 GET 才重试：代理链路抖动时（超时 / 连接失败）隔 700ms 再打一次；
+    // 下单类请求绝不重放，避免重复成交
+    const name = (e && e.name) || "";
+    if(method === "GET" && (name === "AbortError" || name === "TypeError")){
+      await new Promise(r=>setTimeout(r, 700));
+      return await attempt(timeoutMs);
+    }
+    throw e;
+  }
 }
 async function signedFetch(acct, method, path, query, timeoutMs=12000){
   const doFetch = async(q) => {
